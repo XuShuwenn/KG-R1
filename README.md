@@ -1,7 +1,5 @@
 # KG-R1: Efficient and Transferable Knowledge Graph-Augmented Reinforcement Learning
 
-**📄 Preprint**: - [KG-R1: Efficient and Transferable Agentic KG-RAG via RL](https://arxiv.org/pdf/2509.26383v1).
-
 **🔬 Key Innovation - Single-Agent KG Reasoning**:
 1. ✅ **Single-Agent Architecture**: Replaces complex multi-module workflows with unified LLM agent
 2. ✅ **Schema-Agnostic KG Server**: Works across different knowledge graphs (Freebase, Wikidata, Temporal KGs)  
@@ -21,7 +19,7 @@
 - **Efficiency Gains**: ~1680x computational cost vs naive calculation, but highly effective
 - **Transferability**: Models trained on one KG work on different KG schemas
 
-**🚀 Current Status**: Production-ready KG-R1 system with comprehensive evaluation framework and LLM-as-judge factuality evaluation for Knowledge Graph Question Answering.
+**🚀 Current Status**: KG-R1 system with comprehensive evaluation framework and LLM-as-judge factuality evaluation for Knowledge Graph Question Answering.
 
 ## KG-R1 System Architecture
 
@@ -102,12 +100,10 @@ Paper: [link1](https://arxiv.org/pdf/2503.09516), [link2](https://arxiv.org/abs/
 
 ## News
 
-- [2025.12] **📄 KG-R1 submitted to ICLR 2026** Paper: "KG-R1: Efficient and Transferable Agentic KG-RAG via RL"
-- [2025.12] Added comprehensive evaluation framework with LLM-as-judge for factuality assessment
 - [2025.11] Implemented cross-KG transferability testing on multiple knowledge graphs
-- [2025.10] Released KG-R1 codebase with GRPO training and multi-turn KG reasoning
-- [2025.9] Achieved significant performance gains on CWQ and WebQSP benchmarks
-- [2025.8] Developed schema-agnostic KG server with 4 basic operations
+- [2025.11] Released KG-R1 codebase with GRPO training and multi-turn KG reasoning
+- [2025.11] Added comprehensive evaluation framework with LLM-as-judge for factuality assessment
+- [2025.11] Developed schema-agnostic KG server with 4 basic operations
 
 ## Links
 
@@ -346,10 +342,10 @@ bash eval_scripts/kg_r1_eval_main/eval_qwen_3b_cwq_f1_turn7_hf.sh \
 | **KG-R1 (3 runs)** | 73.1 / 73.1 | 52.8 / 61.0 | 86.8 / 91.5 | 63.9 / 65.5 | 36.2 / 48.4 | **74.1 / 79.4** |
 
 ### Key Achievements
-- **🎯 State-of-the-art Performance**: Best results on CWQ and competitive on WebQSP
+- **🎯 Strong Performance**: Competitive results on CWQ and WebQSP benchmarks
 - **⚡ Computational Efficiency**: Single-agent vs multi-module workflows (1 vs 2-5 modules)
 - **🔄 Cross-KG Transfer**: 64-74% average F1 across 5 different KG schemas
-- **💡 Training Efficiency**: 3B model outperforms 7B and GPT-based systems
+- **💡 Training Efficiency**: 3B model achieves competitive performance
 
 ## Inference
 #### You can play with the trained KG-R1 model with your own questions.
