@@ -2,9 +2,9 @@
 
 **🔬 Key Innovation - Single-Agent KG Reasoning**:
 1. ✅ **Single-Agent Architecture**: Replaces complex multi-module workflows with unified LLM agent
-2. ✅ **Schema-Agnostic KG Server**: Works across different knowledge graphs (Freebase, Wikidata, Temporal KGs)  
+2. ✅ **Schema-Agnostic KG Server**: Works across different knowledge graphs (Freebase, Wikidata, Temporal KGs)
 3. ✅ **Cross-KG Transferability**: Plug-and-play capability - train once, transfer anywhere
-4. ✅ **Efficiency Breakthrough**: ~83% of tokens from KG retrieval, only ~13% from reasoning generation
+4. ✅ **Efficiency Gains**: ~83% of tokens from KG retrieval, only ~13% from reasoning generation
 5. ✅ **GRPO Training**: Group Relative Policy Optimization for stable multi-turn learning
 
 **⚡ System Architecture**:
@@ -14,7 +14,7 @@
 - **Lightweight Design**: No separate retriever, reranker, or planning modules
 
 **📊 Performance Results**:
-- **CWQ Dataset**: Significant improvement over vanilla baselines and prior KG-RAG methods
+- **CWQ Dataset**: Improved performance over vanilla baselines and prior KG-RAG methods
 - **WebQSP Dataset**: Strong performance with cross-dataset transferability
 - **Efficiency Gains**: ~1680x computational cost vs naive calculation, but highly effective
 - **Transferability**: Models trained on one KG work on different KG schemas
@@ -446,17 +446,8 @@ You can refer to `kg_r1/search/server.py` for the complete KG server implementat
 - **Error handling**: Robust error handling for malformed queries
 
 ### Cross-KG Transfer
-KG-R1's key advantage is cross-KG transferability. Models trained on one KG can transfer to different KG schemas without retraining, making it truly plug-and-play.
+KG-R1's key advantage is cross-KG transferability. Models trained on one KG can transfer to different KG schemas without retraining, enabling plug-and-play usage.
 
 ## Citations
 
-If you use KG-R1 in your research, please cite:
-
-```bibtex
-@article{kg_r1_2025,
-  title={KG-R1: Efficient and Transferable Agentic KG-RAG via RL},
-  author={[Authors]},
-  journal={arXiv preprint arXiv:[ARXIV_ID]},
-  year={2025}
-}
-```
+If you use KG-R1 in your research, citation information will be provided upon publication.
