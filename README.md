@@ -232,6 +232,8 @@ pip install networkx pandas pyarrow numpy scipy
 
 **Train KG-R1 agent using reinforcement learning**
 
+> **Note**: We will provide the HuggingFace model weights pretrained (backbone: Qwen2.5-3B) later.
+
 **(1) Launch the KG retrieval server**
 ```bash
 conda activate kg_server
@@ -449,24 +451,6 @@ You can refer to `kg_r1/search/server.py` for the complete KG server implementat
 
 ### Cross-KG Transfer
 KG-R1's key advantage is cross-KG transferability. Models trained on one KG can transfer to different KG schemas without retraining, making it truly plug-and-play.
-
-## Features
-- **Single-agent architecture**: Unified reasoning and retrieval in one LLM. ✔️
-- **Schema-agnostic KG operations**: Works across different KG schemas. ✔️
-- **Cross-KG transferability**: Plug-and-play capability across knowledge graphs. ✔️
-- **Multi-turn KG reasoning**: Up to 7 turns of iterative knowledge exploration. ✔️
-- **GRPO training**: Group Relative Policy Optimization for stable learning. ✔️
-- **Efficient KG server**: FastAPI-based server with concurrent processing. ✔️
-- **LLM-as-judge evaluation**: Semantic factuality assessment beyond exact matching. ✔️
-- **Support different LLMs**: Qwen2.5, Llama3, and other transformer models. ✔️
-- **VLLM integration**: Efficient inference backend with batching optimization. ✔️
-
-## Acknowledge
-
-KG-R1 builds upon the foundation established by [Search-R1](https://github.com/PeterGriffinJin/Search-R1), extending the reasoning-and-searching paradigm to knowledge graphs.
-The implementation is built upon [veRL](https://github.com/volcengine/verl) for reinforcement learning and integrates ideas from [RAGEN](https://github.com/ZihanWang314/RAGEN/tree/main) for knowledge graph reasoning.
-We acknowledge the contributions of [Deepseek-R1](https://github.com/deepseek-ai/DeepSeek-R1) and [TinyZero](https://github.com/Jiayi-Pan/TinyZero/tree/main) for inspiring the RL-based reasoning approaches.
-We sincerely appreciate the efforts of these teams for their contributions to open-source research and development.
 
 ## Citations
 

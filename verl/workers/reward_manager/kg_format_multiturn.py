@@ -1241,30 +1241,47 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
 
         # Build normalized ground truth entity set
         # For dict-based ground truth, each index is a distinct entity with possible text/kb_id variants
+        # IMPORTANT: text and kb_id at the SAME index are alternative representations of the SAME entity
         num_entities = max(len(target_texts), len(target_kb_ids))
         if num_entities == 0:
             return {'f1': 0.0, 'precision': 0.0, 'recall': 1.0}
 
-        # Build a set of all valid ground truth representations
-        ground_truth_normalized_set = set()
+        # Build list of ground truth entities where each entity has alternative representations
+        ground_truth_entities = []
         for i in range(num_entities):
+            entity_representations = set()
+
             # Add text form
             if i < len(target_texts) and target_texts[i]:
                 normalized_text = normalize_answer(str(target_texts[i]))
                 if normalized_text:
-                    ground_truth_normalized_set.add(normalized_text)
+                    entity_representations.add(normalized_text)
 
-            # Add kb_id form
+            # Add kb_id form (alternative representation of the SAME entity)
             if i < len(target_kb_ids) and target_kb_ids[i]:
                 normalized_kb = normalize_answer(str(target_kb_ids[i]))
                 if normalized_kb:
-                    ground_truth_normalized_set.add(normalized_kb)
+                    entity_representations.add(normalized_kb)
 
-        # Set-based comparison: find intersection
-        correct_entities = predicted_normalized_set & ground_truth_normalized_set
-        num_correct = len(correct_entities)
+            if entity_representations:
+                ground_truth_entities.append(entity_representations)
+
+        # Match predicted entities against ground truth entities
+        # An entity is correct if it matches ANY representation of a ground truth entity
+        matched_gt_entities = set()
+        matched_pred_entities = set()
+
+        for pred_entity in predicted_normalized_set:
+            for gt_idx, gt_entity_reps in enumerate(ground_truth_entities):
+                if pred_entity in gt_entity_reps:
+                    # This predicted entity matches this ground truth entity
+                    matched_gt_entities.add(gt_idx)
+                    matched_pred_entities.add(pred_entity)
+                    break  # Move to next predicted entity
+
+        num_correct = len(matched_pred_entities)
         num_predicted = len(predicted_normalized_set)
-        num_ground_truth = len(ground_truth_normalized_set)
+        num_ground_truth = len(ground_truth_entities)
 
         # Calculate proper set-based metrics
         precision = num_correct / num_predicted if num_predicted > 0 else 0.0
