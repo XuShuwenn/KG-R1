@@ -27,6 +27,7 @@ This document outlines the implementation plan for integrating Knowledge Graph (
 3. ✅ **KG Reward System** (`kg_format.py`) - Specialized reward manager with KG-aware scoring
 4. ✅ **KG Data Pipeline** - Data processing for KG-enhanced training (WebQSP, CWQ)
 5. ✅ **KG Scoring Functions** (`qa_em_format_kg.py`) - KG-specific exact match and format validation
+6. ✅ **KGQA SPARQL Adapter** (`kg_r1/kgqa_bridge/sparql_adapter.py`) - Direct Virtuoso bridge reusing `kgqa_agent` query semantics
 
 ## Implementation Structure (Current)
 
@@ -217,6 +218,7 @@ def compute_score_em_kg(solution_str, ground_truth, method='kg_aware', ...):
 - ✅ **Search Configuration**: Enables KG search with proper URL and parameters
 - ✅ **Reward Configuration**: Uses `reward_model.reward_manager=kg_format`
 - ✅ **KG Configuration**: Server URL, max turns, and generation parameters
+- ✅ **SPARQL Bridge**: Optional direct Virtuoso access via `kgqa_agent` tools when `kg_config.use_sparql_bridge=true`
 
 **Key Configuration:**
 ```bash
@@ -228,6 +230,10 @@ actor_rollout_ref.rollout.search.search_url="http://127.0.0.1:8001/retrieve" \
 kg_config.server_url="http://127.0.0.1:8001/retrieve" \
 kg_config.max_turns=6 \
 kg_config.enable_kg_during_training=true \
+kg_config.use_sparql_bridge=true \
+kg_config.sparql_endpoint="http://127.0.0.1:8890/sparql" \
+kg_config.kg_top_k=3 \
+kg_config.max_calls=7 \
 reward_model.enable=true \
 reward_model.reward_manager=kg_format \
 ```

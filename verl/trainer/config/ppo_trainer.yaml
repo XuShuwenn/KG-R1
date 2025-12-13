@@ -180,7 +180,7 @@ actor_rollout_ref:
     clip_ratio_c: 3.0
     
     # Loss aggregation mode: "token-mean", "seq-mean-token-sum", "seq-mean-token-mean", or "unbiased-fixed-norm"
-    loss_agg_mode: ${actor_rollout_ref.actor.loss_agg_mode}
+    loss_agg_mode: "token-mean"
     
     # Entropy regularization coefficient in PPO loss
     entropy_coeff: 0
@@ -611,7 +611,7 @@ critic:
   cliprange_value: 0.5
 
   # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
-  loss_agg_mode: ${actor_rollout_ref.actor.loss_agg_mode}
+  loss_agg_mode: "token-mean"
 
   # checkpoint configs
   checkpoint:

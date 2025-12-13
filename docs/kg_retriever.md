@@ -20,6 +20,26 @@ The KG Retriever Server provides an API to perform specific actions on knowledge
 *   **Batch Processing:** The server can handle a list of requests, allowing multiple actions to be performed in a single API call.
 *   **RoG Format:** Designed to work with subgraphs from `rmanluo/RoG-webqsp` and `rmanluo/RoG-cwq` Hugging Face datasets.
 
+## Direct SPARQL Mode (kgqa_agent Bridge)
+
+Some experiments now bypass the FastAPI retriever entirely and talk to a Virtuoso SPARQL endpoint using the `kgqa_agent` interactive tools. This is useful when you want the RL agent to query the full Freebase graph instead of RoG subgraphs.
+
+To enable the bridge in any `train_*kg*.sh` script:
+
+```bash
++kg_config.enable_kg_during_training=true \
++kg_config.use_sparql_bridge=true \
++kg_config.sparql_endpoint="http://127.0.0.1:8890/sparql" \
++kg_config.kg_top_k=3 \
++kg_config.max_calls=7
+```
+
+With `use_sparql_bridge=true`, the PPO trainer skips HTTP calls to `/retrieve` and instantiates `kg_r1.kgqa_bridge.KGQASparqlAdapter`, which reuses `kgqa_agent.src.tools.direct_sparql_client.DirectSPARQLKGClient`. `<kg-query>` blocks can now contain kgqa-style function calls such as `get_relations("entity")` and `get_triples("entity", ["rel"])`, and the responses are injected directly back into the rollout via `<information>` tags.
+
+**Dependencies:** Ensure the runtime has `SPARQLWrapper` and `rank_bm25` installed (already required by `kgqa_agent`). The Virtuoso endpoint URL can omit `/sparql`; the adapter appends it automatically.
+
+> Tip: Keep the FastAPI retriever config in place so you can flip between RoG and SPARQL modes by toggling `kg_config.use_sparql_bridge`.
+
 ## Setup and Launching
 
 ### 1. Prerequisites

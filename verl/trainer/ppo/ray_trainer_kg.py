@@ -728,12 +728,18 @@ class RayPPOTrainer:
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
         
-        # Check if KG generation is enabled (following same pattern as search trainer)
+        # Normalize optional KG bridge configuration (sparql endpoint, etc.)
+        self.kg_bridge_config = self._normalize_kg_bridge_config(getattr(config, "kg_config", None))
+
+        # Check if KG generation is enabled via legacy search config or new kg_config toggle
         search_config = getattr(config.actor_rollout_ref.rollout, 'search', None)
-        self.use_search_generation = search_config is not None and search_config.get('enable', False)
+        search_enabled = bool(search_config and search_config.get('enable', False))
+        kg_enabled = bool(self.kg_bridge_config.get('enable_kg_during_training', False))
+        self.use_search_generation = search_enabled or kg_enabled
         
         if self.use_search_generation:
-            self.search_config = search_config
+            # Allow training to run even if legacy search config is omitted when kg_config drives the flow
+            self.search_config = search_config or {}
             
             # For KG generation with GRPO, we use trainer-side batch expansion
             grpo_rollout_n = getattr(config.actor_rollout_ref.rollout, 'grpo_rollout_n', None)
@@ -769,6 +775,56 @@ class RayPPOTrainer:
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _normalize_kg_bridge_config(self, kg_cfg) -> dict:
+        """
+        Convert optional kg_config node into a plain dict with sane defaults so that
+        downstream components can rely on explicit keys regardless of how users
+        populate Hydra configs / CLI overrides.
+        """
+        defaults = {
+            "enable_kg_during_training": False,
+            "server_url": None,
+            "max_turns": None,
+            "use_sparql_bridge": False,
+            "sparql_endpoint": None,
+            "relation_filter_model": None,
+            "kg_top_k": None,
+            "max_calls": None,
+        }
+
+        if kg_cfg is None:
+            return defaults
+
+        if isinstance(kg_cfg, dict):
+            cfg_dict = kg_cfg
+        else:
+            try:
+                if OmegaConf.is_config(kg_cfg):
+                    cfg_dict = OmegaConf.to_container(kg_cfg, resolve=True)
+                else:
+                    cfg_dict = dict(kg_cfg)
+            except Exception:
+                cfg_dict = {}
+
+        normalized = defaults.copy()
+        for key in defaults.keys():
+            value = cfg_dict.get(key) if isinstance(cfg_dict, dict) else None
+            if value is not None:
+                normalized[key] = value
+
+        # Legacy/alias fields support
+        if normalized["sparql_endpoint"] is None:
+            alias_value = cfg_dict.get("sparql_url") if isinstance(cfg_dict, dict) else None
+            if alias_value:
+                normalized["sparql_endpoint"] = alias_value
+
+        # Allow server_url to double as SPARQL endpoint when it already ends with /sparql
+        if normalized["sparql_endpoint"] is None and normalized["server_url"]:
+            server_url = normalized["server_url"]
+            normalized["sparql_endpoint"] = server_url if server_url.endswith("/sparql") else f"{server_url.rstrip('/')}/sparql"
+
+        return normalized
 
     def _validate_config(self):
         config = self.config
@@ -1424,16 +1480,35 @@ class RayPPOTrainer:
         # Initialize generation manager for KG search if enabled (following search trainer pattern)
         if self.use_search_generation:
             from kg_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
+            max_turns = self.search_config.get('max_turns')
+            if max_turns is None:
+                max_turns = self.kg_bridge_config.get('max_turns', 6)
+            max_turns = max_turns or 6
+
+            search_url = self.search_config.get('search_url')
+            if search_url is None:
+                search_url = self.kg_bridge_config.get('server_url', 'http://127.0.0.1:8001/retrieve')
+
+            topk_value = self.search_config.get('topk')
+            if topk_value is None:
+                topk_value = self.kg_bridge_config.get('kg_top_k')
+            topk_value = topk_value or 5
+
             gen_config = GenerationConfig(
-                max_turns=self.search_config.get('max_turns', 6),  # KG default: 6 turns
+                max_turns=max_turns,  # KG default fallback: 6 turns
                 max_start_length=self.config.data.get('max_start_length', 1000),  # KG default: 1000
                 max_prompt_length=self.config.data.max_prompt_length,
                 max_response_length=self.config.data.max_response_length,
                 max_obs_length=self.config.data.get('max_obs_length', 650),  # KG default: 650
                 num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
                 no_think_rl=self.config.algorithm.get('no_think_rl', False),
-                search_url=self.search_config.get('search_url', 'http://127.0.0.1:8001/retrieve'),  # KG server default
-                topk=self.search_config.get('topk', 5),  # KG default: 5
+                search_url=search_url,
+                topk=topk_value,
+                use_sparql_bridge=self.kg_bridge_config.get('use_sparql_bridge', False),
+                sparql_endpoint=self.kg_bridge_config.get('sparql_endpoint'),
+                kgqa_relation_filter_model=self.kg_bridge_config.get('relation_filter_model'),
+                kgqa_max_calls=self.kg_bridge_config.get('max_calls'),
+                kgqa_top_k=self.kg_bridge_config.get('kg_top_k'),
             )
             
             self.generation_manager = LLMGenerationManager(
@@ -1441,6 +1516,8 @@ class RayPPOTrainer:
                 actor_rollout_wg=self.actor_rollout_wg,
                 config=gen_config,
             )
+            if self.kg_bridge_config.get('use_sparql_bridge', False):
+                print(f"[KG_BRIDGE] Using kgqa_agent SPARQL bridge (endpoint: {self.kg_bridge_config.get('sparql_endpoint')})")
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False

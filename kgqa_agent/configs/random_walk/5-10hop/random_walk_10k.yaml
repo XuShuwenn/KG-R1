@@ -1,0 +1,24 @@
+seed: 42
+walks:
+  num_starts: 10000
+  max_hops: 10
+  min_hops: 5
+  max_attempts: 100000
+  start_pool_size: 512
+  pred_sample_m: 32
+  per_pred_pool_k: 32
+
+output:
+  dir: kgqa_agent/data/5-10-hop/test_10k/paths
+  
+sparql:
+  config: kgqa_agent/configs/sparql.yaml
+
+allow-predicates-json: datasets/cwq/cwq_predicates/filtered_cwq_white_list.json
+allow-predicates-top-k: 0
+
+start-predicates-json: datasets/cwq/cwq_predicates/filtered_cwq_white_list.json
+start-predicates-top-k: 0
+
+filters:
+  # 白名单模式：仅使用 allow-predicates-json 中的谓词

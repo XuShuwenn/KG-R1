@@ -12,6 +12,7 @@ import requests
 import json # Added for parsing JSON queries and formatting fallback
 from functools import lru_cache
 from kg_r1.search.error_types import KGErrorType
+from kg_r1.kgqa_bridge import KGQASparqlAdapter
 
 @dataclass
 class GenerationConfig:
@@ -29,6 +30,11 @@ class GenerationConfig:
     cwq_server_url: str = None 
     webqsp_server_url: str = None
     metaqa_server_url: str = None  # Default: MetaQA server on port 9002
+    use_sparql_bridge: bool = False
+    sparql_endpoint: str = None
+    kgqa_relation_filter_model: str = None
+    kgqa_max_calls: int = None
+    kgqa_top_k: int = None
 
 class LLMGenerationManager:
     def __init__(
@@ -46,6 +52,28 @@ class LLMGenerationManager:
         self.actor_rollout_wg = actor_rollout_wg
         self.config = config
         self.is_validation = is_validation
+        self.use_sparql_bridge = bool(config.use_sparql_bridge)
+        self.kgqa_adapter: KGQASparqlAdapter | None = None
+        if self.use_sparql_bridge:
+            adapter_endpoint = config.sparql_endpoint or config.search_url
+            if not adapter_endpoint:
+                raise ValueError("SPARQL bridge enabled but no sparql_endpoint/search_url provided.")
+            adapter_top_k = config.kgqa_top_k or config.topk
+            adapter_max_calls = config.kgqa_max_calls or 10  # Default to 10 if not specified
+            adapter_filter_model = config.kgqa_relation_filter_model
+            self.kgqa_adapter = KGQASparqlAdapter(
+                sparql_endpoint=adapter_endpoint,
+                kg_top_k=adapter_top_k,
+                max_calls=adapter_max_calls,
+                relation_filter_model=adapter_filter_model,
+            )
+            filter_msg = (
+                adapter_filter_model if adapter_filter_model else "disabled"
+            )
+            print(
+                f"[KG_BRIDGE] Initialized kgqa_agent SPARQL adapter @ {adapter_endpoint} "
+                f"(max_calls={adapter_max_calls}, relation_filter_model={filter_msg})"
+            )
         
         # Track if we've already logged routing for each dataset
         self._routing_logged = set()
@@ -60,8 +88,9 @@ class LLMGenerationManager:
         # Pre-compile regex patterns for optimization
         self._init_regex_patterns()
         
-        # Initialize server routing configuration
-        self._init_server_routing()
+        # Initialize server routing configuration (only for FastAPI mode, not for SPARQL bridge)
+        if not self.use_sparql_bridge:
+            self._init_server_routing()
 
     def _setup_tokenizer_compatibility(self):
         """
@@ -143,6 +172,13 @@ class LLMGenerationManager:
         Returns:
             Server URL for the dataset
         """
+        # This method should only be called in FastAPI mode (not SPARQL bridge mode)
+        if not hasattr(self, 'server_routing') or not hasattr(self, 'fallback_server_url'):
+            raise RuntimeError(
+                "Server routing not initialized. This method should only be called in FastAPI mode, "
+                "not in SPARQL bridge mode."
+            )
+        
         if not dataset_name:
             return self.fallback_server_url
             
@@ -162,6 +198,30 @@ class LLMGenerationManager:
             
         return server_url
 
+    def _build_bridge_session_keys(self, meta_info: Dict[str, Any] | None, count: int) -> List[str]:
+        """Ensure per-example session keys for kgqa adapter."""
+        if not self.use_sparql_bridge:
+            return []
+
+        if meta_info is None:
+            meta_info = {}
+
+        keys = meta_info.get("bridge_session_keys")
+        if isinstance(keys, list) and len(keys) == count:
+            return keys
+
+        sample_ids = meta_info.get("sample_ids", [])
+        session_keys: List[str] = []
+        for idx in range(count):
+            base_id = sample_ids[idx] if idx < len(sample_ids) else f"sparql_sample_{idx:06d}"
+            session_keys.append(f"{base_id}__idx_{idx}")
+        meta_info["bridge_session_keys"] = session_keys
+        return session_keys
+
+    def _reset_bridge_session(self, session_key: str) -> None:
+        if self.use_sparql_bridge and self.kgqa_adapter and session_key:
+            self.kgqa_adapter.reset(session_key)
+
     def _init_regex_patterns(self):
         """Pre-compile all regex patterns for performance optimization."""
         # Patterns for postprocess_predictions
@@ -169,6 +229,7 @@ class LLMGenerationManager:
         self.kg_query_pattern1 = re.compile(r'<kg-query>(.*?)</kg-query>', re.DOTALL)  
         self.kg_query_pattern2 = re.compile(r'<kg-query\s+([^>]+)\s*/>', re.DOTALL)
         self.answer_pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
+        self.think_pattern = re.compile(r'<think>(.*?)</think>', re.DOTALL)
         
         # Patterns for _parse_kg_query
         self.prefix_patterns = [
@@ -247,7 +308,7 @@ class LLMGenerationManager:
         if self.config.no_think_rl:
             raise ValueError('stop')
             # if no_think_rl is enabled, only keep action in the str
-            actions, _ = self.env.postprocess_predictions(responses_str)
+            actions, _, _ = self.env.postprocess_predictions(responses_str)
             responses_str=[f"<answer>{envs[idx].ACTION_LOOKUP[action]}</answer>" for idx, action in enumerate(actions)]
         
         responses = self._batch_tokenize(responses_str)
@@ -530,14 +591,15 @@ class LLMGenerationManager:
                 "is_search_actions": [],
                 "raw_server_responses": [],
                 "responses_str": [],
+                "reasonings": [],
             })
         
         print(f"[DEBUG-INTERACTION] Created interaction_history with data_source info: {[h['data_source'] for h in interaction_history[:3]]}...")
 
-        # Main generation loop
-        for step in range(self.config.max_turns):
-            if not active_mask.sum():
-                break
+        # Main generation loop - continue until all samples are done (no turn limit, only query count limit)
+        step = 0
+        while active_mask.sum():
+            step += 1
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
@@ -557,25 +619,30 @@ class LLMGenerationManager:
             
             # Execute in environment and process observations
             # Note: The batch is already expanded on the trainer side for multiple rollouts
+            # When max_calls is reached, execute_predictions will return FORCE_ANSWER_PROMPT in next_obs
+            # and the model should respond with <answer> tag, which will set done=True
             next_obs, dones, valid_action, is_search, raw_server_responses = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, gen_batch.meta_info, active_mask
             )
             
             # Store interaction details for this turn
-            cur_actions, _ = self.postprocess_predictions(responses_str)
+            cur_actions, _, cur_reasonings = self.postprocess_predictions(responses_str)
             for i in range(actual_batch_size):
                 if active_mask[i]:  # Active samples: record actual data
+                    reasoning_entry = cur_reasonings[i] if i < len(cur_reasonings) else ""
                     interaction_history[i]["actions"].append(cur_actions[i])
                     interaction_history[i]["search_results"].append(next_obs[i])
                     interaction_history[i]["valid_actions"].append(valid_action[i])
                     interaction_history[i]["is_search_actions"].append(is_search[i])
                     interaction_history[i]["responses_str"].append(responses_str[i])
+                    interaction_history[i]["reasonings"].append(reasoning_entry)
                 else:  # Inactive samples: record placeholder data for consistency
                     interaction_history[i]["actions"].append("")  # No action
                     interaction_history[i]["search_results"].append("")  # No search result
                     interaction_history[i]["valid_actions"].append(0)  # Invalid action
                     interaction_history[i]["is_search_actions"].append(0)  # Not search
                     interaction_history[i]["responses_str"].append("")  # No response
+                    interaction_history[i]["reasonings"].append("")
                 
                 # ALL samples get raw_server_responses recorded for batch consistency
                 interaction_history[i]["raw_server_responses"].append(raw_server_responses[i])
@@ -602,74 +669,8 @@ class LLMGenerationManager:
                 original_right_side,
                 responses_ids,
                 next_obs_ids,
-                turn_idx=step + 1,
+                turn_idx=step,
                 active_mask=active_mask
-            )
-            
-        # final LLM rollout
-        if active_mask.sum():
-            rollings.batch = self.tensor_fn.cut_to_effective_len(
-                rollings.batch,
-                keys=['input_ids', 'attention_mask', 'position_ids']
-            )
-
-            # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
-            rollings_active = DataProto.from_dict({
-                k: v[active_mask] for k, v in rollings.batch.items()
-            })
-            
-            gen_output = self._generate_with_gpu_padding(rollings_active)
-
-            meta_info = gen_output.meta_info            
-            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
-            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
-
-            # Execute in environment and process observations
-            _, dones, valid_action, is_search, raw_server_responses = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, gen_batch.meta_info, active_mask, do_search=False
-            )
-
-            # Store final turn interaction details
-            cur_actions, _ = self.postprocess_predictions(responses_str)
-            query_response_idx = 0
-            for i in range(actual_batch_size):
-                if active_mask[i]:  # Active samples: record actual final turn data
-                    action = cur_actions[i]
-                    interaction_history[i]["actions"].append(action)
-                    interaction_history[i]["search_results"].append('')  # No search in final turn
-                    interaction_history[i]["valid_actions"].append(valid_action[i])
-                    interaction_history[i]["is_search_actions"].append(is_search[i])
-                    interaction_history[i]["responses_str"].append(responses_str[i])
-                else:  # Inactive samples: record placeholder data for consistency
-                    interaction_history[i]["actions"].append("")  # No action
-                    interaction_history[i]["search_results"].append('')  # No search in final turn
-                    interaction_history[i]["valid_actions"].append(0)  # Invalid action
-                    interaction_history[i]["is_search_actions"].append(0)  # Not search
-                    interaction_history[i]["responses_str"].append("")  # No response
-
-                # Final turn: Use actual raw_server_responses from execute_predictions
-                # This ensures KG queries in final turn get proper error responses instead of empty dicts
-                if i < len(raw_server_responses):
-                    interaction_history[i]["raw_server_responses"].append(raw_server_responses[i])
-                else:
-                    # Fallback for cases where raw_server_responses is shorter than expected
-                    interaction_history[i]["raw_server_responses"].append({})
-
-            # Store original active_mask before updating with done status
-            final_turn_active_mask = active_mask.clone()
-            
-            curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
-            active_mask = active_mask * curr_active_mask
-            active_num_list.append(active_mask.sum().item())
-            valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
-            valid_search_stats += torch.tensor(is_search, dtype=torch.int)
-            
-
-            original_right_side = self._update_right_side(
-                original_right_side,
-                responses_ids,
-                turn_idx=self.config.max_turns + 1,
-                active_mask=final_turn_active_mask  # Use original active_mask for final turn
             )
         
         meta_info['turns_stats'] = turns_stats.tolist()
@@ -793,7 +794,11 @@ class LLMGenerationManager:
         Returns:
             Tuple of (next_obs, dones, valid_action, is_search, raw_server_responses)
         """
-        cur_actions, contents = self.postprocess_predictions(predictions)
+        if meta_info is None:
+            meta_info = {}
+
+        cur_actions, contents, _ = self.postprocess_predictions(predictions)
+        session_keys = self._build_bridge_session_keys(meta_info, len(cur_actions)) if self.use_sparql_bridge else []
         
         # Check for responses that exceed max_prompt_length and mark them as invalid
         response_length_exceeded = []
@@ -871,19 +876,40 @@ class LLMGenerationManager:
                     # CRITICAL FIX: Use the mapping to get the correct response for this sample
                     if i in kg_response_map:
                         kg_result, raw_kg_response = kg_response_map[i]
-                        next_obs.append(f'\n\n<information>{kg_result.strip()}</information>\n\n')
-                        raw_server_responses.append(raw_kg_response)
+                        # Check if max_calls limit was reached (FORCE_ANSWER_PROMPT returned)
+                        # When max_calls is reached, we should set done=True to force the model to answer
+                        # The FORCE_ANSWER_PROMPT is already in kg_result, so we just need to check the meta
+                        is_max_calls_reached = (
+                            isinstance(raw_kg_response, dict) and
+                            raw_kg_response.get("meta", {}).get("action") == "max_calls_reached"
+                        )
+                        
+                        if is_max_calls_reached:
+                            # Max calls reached: return FORCE_ANSWER_PROMPT and set done=True
+                            # This forces the model to answer in the next turn (which will be the last)
+                            next_obs.append(f'\n\n<information>{kg_result.strip()}</information>\n\n')
+                            raw_server_responses.append(raw_kg_response)
+                            dones.append(1)  # Force done to end conversation after model answers
+                            valid_action.append(1)  # The query itself was valid
+                            is_search.append(1)
+                        else:
+                            # Normal query: continue conversation
+                            next_obs.append(f'\n\n<information>{kg_result.strip()}</information>\n\n')
+                            raw_server_responses.append(raw_kg_response)
+                            dones.append(0)  # Continue conversation
+                            # Fix: KG queries are invalid if search is disabled (final turn)
+                            if do_search:
+                                valid_action.append(1)  # Valid when search is enabled
+                            else:
+                                valid_action.append(0)  # Invalid in final turn when search is disabled
+                            is_search.append(1)
                     else:
                         # Fallback if something went wrong
                         next_obs.append(f'\n\n<information>Error: No response found for this query</information>\n\n')
                         raw_server_responses.append({"error": "No response mapped"})
-                    dones.append(0)
-                    # Fix: KG queries are invalid if search is disabled (final turn)
-                    if do_search:
-                        valid_action.append(1)  # Valid when search is enabled
-                    else:
-                        valid_action.append(0)  # Invalid in final turn when search is disabled
-                    is_search.append(1)
+                        dones.append(0)
+                        valid_action.append(0)
+                        is_search.append(1)
                 elif action == 'search':
                     next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
                     dones.append(0)
@@ -903,56 +929,67 @@ class LLMGenerationManager:
             
         # CRITICAL FIX: Remove assertion since we're using mapping now
         assert len(search_results) == 0
+
+        if self.use_sparql_bridge and session_keys:
+            for idx, done in enumerate(dones):
+                if done and idx < len(session_keys):
+                    self._reset_bridge_session(session_keys[idx])
             
         return next_obs, dones, valid_action, is_search, raw_server_responses
 
-    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[str], List[str]]: # Changed return type for contents
+    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[str], List[str], List[str]]:
         """
-        Process (text-based) predictions from llm into actions and their contents.
+        Process (text-based) predictions from llm into actions, their contents, and reasoning traces.
         
         Args:
             predictions: List of raw predictions
             
         Returns:
-            Tuple of (actions list, contents list) 
+            Tuple of (actions list, contents list, reasonings list)
             Content for search is the string "action_type, entity_id [, relation_name]"
             Content for answer is the answer string.
         """
-        actions = []
-        contents = []
+        actions: List[str] = []
+        contents: List[str] = []
+        reasonings: List[str] = []
                 
         for prediction in predictions:
             if isinstance(prediction, str): # for llm output
-                # Use simpler, more robust pattern matching like the search version
-                kg_pattern = r'<(kg-query)>(.*?)</\1>'
-                search_pattern = r'<(search)>(.*?)</\1>'
-                answer_pattern = r'<(answer)>(.*?)</\1>'
-                
-                # Try patterns in order - answer first, then kg-query, then search
-                match = re.search(answer_pattern, prediction, re.DOTALL)
-                if match:
-                    content = match.group(2).strip()
-                    action = 'answer'
+                # Extract reasoning/think content (if present)
+                reasoning_match = self.think_pattern.search(prediction) if hasattr(self, "think_pattern") else None
+                reasonings.append(reasoning_match.group(1).strip() if reasoning_match else "")
+
+                # Determine action based on actual tag order
+                candidates: List[Tuple[str, int, str]] = []
+
+                answer_match = self.answer_pattern.search(prediction)
+                if answer_match:
+                    candidates.append(("answer", answer_match.start(), answer_match.group(1).strip()))
+
+                kg_query_match = self.kg_query_pattern1.search(prediction)
+                if kg_query_match:
+                    candidates.append(("kg-query", kg_query_match.start(), kg_query_match.group(1).strip()))
                 else:
-                    match = re.search(kg_pattern, prediction, re.DOTALL)
-                    if match:
-                        content = match.group(2).strip()
-                        action = 'kg-query'
-                    else:
-                        match = re.search(search_pattern, prediction, re.DOTALL)
-                        if match:
-                            content = match.group(2).strip()
-                            action = 'search'
-                        else:
-                            content = ''
-                            action = 'error'
+                    kg_query_match2 = self.kg_query_pattern2.search(prediction)
+                    if kg_query_match2:
+                        candidates.append(("kg-query", kg_query_match2.start(), kg_query_match2.group(1).strip()))
+
+                search_match = self.search_pattern.search(prediction)
+                if search_match:
+                    candidates.append(("search", search_match.start(), search_match.group(1).strip()))
+
+                if candidates:
+                    action, _, content = min(candidates, key=lambda item: item[1])
+                else:
+                    action = 'error'
+                    content = ''
             else:
                 raise ValueError(f"Invalid prediction type: {type(prediction)}")
             
             actions.append(action)
             contents.append(content) # content is now the string to be parsed by _batch_search
-            
-        return actions, contents
+
+        return actions, contents, reasonings
 
     def batch_search(self, search_query_contents: List[str] = None, meta_info_list = None) -> Tuple[List[str], List[Dict[str, Any]]]: # Changed to return both
         """
@@ -992,7 +1029,12 @@ class LLMGenerationManager:
         
         raw_server_responses = []
         if valid_queries:
-            kg_server_responses, kg_results = self._batch_search(valid_queries, valid_meta_infos) # Pass list of meta_infos
+            if self.use_sparql_bridge:
+                kg_server_responses, kg_results = self._batch_search_via_sparql_bridge(
+                    valid_queries, valid_meta_infos
+                )
+            else:
+                kg_server_responses, kg_results = self._batch_search(valid_queries, valid_meta_infos) # Pass list of meta_infos
             
             # Merge error messages and valid results in correct order
             final_results = []
@@ -1272,6 +1314,46 @@ class LLMGenerationManager:
         
         return final_responses, formatted_responses
 
+    def _batch_search_via_sparql_bridge(
+        self,
+        search_query_contents: List[str],
+        meta_info_list: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Execute kgqa-style queries directly against the SPARQL endpoint."""
+        if not self.kgqa_adapter:
+            raise RuntimeError("SPARQL bridge requested but adapter is not initialized.")
+
+        raw_payloads: List[Dict[str, Any]] = []
+        formatted_results: List[str] = []
+
+        for idx, query_content_str in enumerate(search_query_contents):
+            meta_info = meta_info_list[idx] if idx < len(meta_info_list) else {}
+            original_sample_id = meta_info.get("sample_id", f"sparql_sample_{idx:06d}")
+            batch_index = meta_info.get("batch_index", idx)
+            session_key = meta_info.get("bridge_session_key")
+            if not session_key:
+                session_key = f"{original_sample_id}__idx_{batch_index}"
+
+            question_text = meta_info.get("question_text", "")
+            topic_entities = meta_info.get("topic_entities")
+
+            formatted, payload = self.kgqa_adapter.run_query(
+                sample_id=session_key,
+                query_str=query_content_str,
+                question=question_text,
+                topic_entities=topic_entities,
+            )
+
+            # Keep track of original sample id for downstream reward logging
+            payload.setdefault("request_payload", {})
+            payload["request_payload"].setdefault("original_sample_id", original_sample_id)
+            payload["request_payload"].setdefault("bridge_session_key", session_key)
+
+            raw_payloads.append(payload)
+            formatted_results.append(formatted)
+
+        return raw_payloads, formatted_results
+
     def _passages2string(self, kg_server_response_item: Dict[str, Any]) -> str:
         """
         Formats a single KG server response item into a string for the LLM.
@@ -1500,6 +1582,8 @@ class LLMGenerationManager:
             List of meta_info dicts, one for each KG query
         """
         kg_query_meta_infos = []
+        bridge_session_keys = meta_info.get("bridge_session_keys", []) if meta_info else []
+        question_list = meta_info.get("original_questions", []) if meta_info else []
         
         # Check if we have per-sample information available
         batch_sample_ids = meta_info.get("sample_ids", [])
@@ -1566,10 +1650,19 @@ class LLMGenerationManager:
                 else:
                     dataset_name = fallback_dataset_name
                 
+                session_key = None
+                if batch_idx < len(bridge_session_keys):
+                    session_key = bridge_session_keys[batch_idx]
+                question_text = ""
+                if batch_idx < len(question_list):
+                    question_text = question_list[batch_idx]
+
                 kg_query_meta_infos.append({
                     "sample_id": sample_id,
                     "dataset_name": dataset_name,
-                    "batch_index": batch_idx  # Add absolute batch index for debugging
+                    "batch_index": batch_idx,  # Add absolute batch index for debugging
+                    "bridge_session_key": session_key,
+                    "question_text": question_text,
                 })
         else:
             # Fallback to old behavior if kg_query_batch_indices not provided
@@ -1590,10 +1683,19 @@ class LLMGenerationManager:
                     else:
                         dataset_name = fallback_dataset_name
                     
+                    session_key = None
+                    if i < len(bridge_session_keys):
+                        session_key = bridge_session_keys[i]
+                    question_text = ""
+                    if i < len(question_list):
+                        question_text = question_list[i]
+                    
                     kg_query_meta_infos.append({
                         "sample_id": sample_id,
                         "dataset_name": dataset_name,
-                        "batch_index": i  # Add absolute batch index for debugging
+                        "batch_index": i,  # Add absolute batch index for debugging
+                        "bridge_session_key": session_key,
+                        "question_text": question_text,
                     })
                     kg_query_idx += 1
         
