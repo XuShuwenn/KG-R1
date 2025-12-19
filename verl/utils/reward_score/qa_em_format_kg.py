@@ -137,6 +137,76 @@ def normalize_answer(s, dataset_name=None):
         return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 
+def strip_information_blocks(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r'<information>.*?</information>', '', text, flags=re.DOTALL | re.IGNORECASE)
+
+
+def strip_chatml_tokens(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"<\|im_start\|>[^>]*?>", "", text)
+    text = text.replace("<|im_end|>", "")
+    text = text.replace("<s>", "").replace("</s>", "")
+    return text
+
+
+def _extract_strings_from_json_like(text: str) -> List[str]:
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return []
+
+    extracted: List[str] = []
+
+    def _walk(node):
+        if isinstance(node, str):
+            value = node.strip()
+            if value:
+                extracted.append(value)
+        elif isinstance(node, dict):
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(parsed)
+    return extracted
+
+
+def _generate_retrieval_candidates(raw_text: str) -> List[str]:
+    if not raw_text:
+        return []
+
+    cleaned = strip_chatml_tokens(strip_information_blocks(raw_text))
+    if not cleaned:
+        return []
+
+    candidates: List[str] = []
+
+    def _add_candidate(value: str):
+        value = value.strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    _add_candidate(cleaned)
+
+    if ':' in cleaned:
+        _add_candidate(cleaned.split(':', 1)[1])
+
+    for line in cleaned.splitlines():
+        _add_candidate(line)
+
+    for json_value in _extract_strings_from_json_like(cleaned):
+        _add_candidate(json_value)
+
+    return candidates
+
+
 def extract_query_identifier(response: Dict) -> str:
     """Extract a unique identifier for the query from the response.
     
@@ -526,13 +596,23 @@ def extract_answer_kg(solution_str: str) -> Union[str, None]:
     """
     # First, remove all <information>...</information> content
     # This prevents error messages from contaminating answer extraction
-    cleaned_str = re.sub(r'<information>.*?</information>', '', solution_str, flags=re.DOTALL)
-    
+    cleaned_str = strip_information_blocks(solution_str)
+    cleaned_str = strip_chatml_tokens(cleaned_str)
+
     # Now search for answer tags in the cleaned string
     answer_pattern = r'<answer>(.*?)</answer>'
     matches = re.findall(answer_pattern, cleaned_str, re.DOTALL)
     
     if len(matches) == 0:
+        lower_cleaned = cleaned_str.lower()
+        open_idx = lower_cleaned.rfind("<answer>")
+        close_idx = lower_cleaned.find("</answer>")
+        if open_idx != -1 and close_idx == -1:
+            fallback = cleaned_str[open_idx + len("<answer>"):]
+            return fallback.strip() if fallback.strip() else None
+        if close_idx != -1 and open_idx == -1:
+            fallback = cleaned_str[:close_idx]
+            return fallback.strip() if fallback.strip() else None
         return None
     
     # For KG responses, we expect exactly one answer tag
@@ -549,45 +629,51 @@ def is_retrieval_correct_kg(text: str, golden_answers: List[str], interaction_hi
         dataset_name: Dataset name for dataset-specific normalization (e.g., "multitq")
     """
     # Check search_results (formatted observations shown to LLM)
+    normalized_golden = [normalize_answer(ans, dataset_name) for ans in golden_answers if ans]
+
+    def _contains_answer(raw_chunk: str) -> bool:
+        for candidate in _generate_retrieval_candidates(raw_chunk):
+            normalized_candidate = normalize_answer(candidate, dataset_name)
+            for golden in normalized_golden:
+                if golden and golden in normalized_candidate:
+                    return True
+        return False
+
     if 'search_results' in interaction_history:
         for result in interaction_history['search_results']:
-            if result and result.strip():
-                # Only check the part after ":" in the retrieval result
-                if ':' in result:
-                    answer_part = result.split(':', 1)[1].strip()
-                else:
-                    answer_part = result.strip()
-                
-                # Check if any golden answer appears in the answer part
-                normalized_result = normalize_answer(answer_part, dataset_name)
-                for golden_answer in golden_answers:
-                    if normalize_answer(golden_answer, dataset_name) in normalized_result:
-                        return True
-    
-    # Also check raw_server_responses for successful retrievals
+            if result and _contains_answer(result):
+                return True
+
     if 'raw_server_responses' in interaction_history:
         for response in interaction_history['raw_server_responses']:
-            if isinstance(response, dict):
-                kg_metadata = response.get('kg_metadata', {})
-                success = kg_metadata.get('success', False)
-                error_type = kg_metadata.get('error_type')
-                
-                # Only check successful retrievals
-                if success and error_type == KGErrorType.SUCCESS:
-                    choices = response.get('choices', [])
-                    if choices and choices[0].get('message', {}).get('content'):
-                        content = choices[0]['message']['content']
-                        
-                        # Only check the part after ":" in the response content
-                        if ':' in content:
-                            answer_part = content.split(':', 1)[1].strip()
-                        else:
-                            answer_part = content.strip()
-                        
-                        normalized_content = normalize_answer(answer_part, dataset_name)
-                        for golden_answer in golden_answers:
-                            if normalize_answer(golden_answer, dataset_name) in normalized_content:
-                                return True
+            if not isinstance(response, dict):
+                continue
+            kg_metadata = response.get('kg_metadata', {})
+            success = kg_metadata.get('success', False)
+            error_type = kg_metadata.get('error_type')
+            if not (success and error_type == KGErrorType.SUCCESS):
+                continue
+
+            candidates = []
+            choices = response.get('choices', [])
+            for choice in choices:
+                content = (
+                    choice.get('message', {}).get('content')
+                    or choice.get('content')
+                )
+                if content:
+                    candidates.append(content)
+            if response.get('content'):
+                candidates.append(response['content'])
+            if response.get('data'):
+                try:
+                    candidates.append(json.dumps(response['data']))
+                except Exception:
+                    pass
+
+            for candidate in candidates:
+                if _contains_answer(candidate):
+                    return True
     return False
 
 

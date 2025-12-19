@@ -28,7 +28,7 @@ class EntityResolver:
     for direct SPARQL use cases.
     """
     
-    def __init__(self, sparql_endpoint: str, timeout: int = 60):
+    def __init__(self, sparql_endpoint: str, timeout: int = 15):
         """Init resolver with endpoint and timeout; keep a small in-memory cache."""
         self.endpoint = sparql_endpoint
         # Setup no_proxy for local SPARQL endpoints

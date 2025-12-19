@@ -324,7 +324,7 @@ def synthesize_information(
     qmap = load_questions_map(qa_file) if qa_file else {}
 
     endpoint = kg_server_url if kg_server_url.endswith('/sparql') else f"{kg_server_url}/sparql"
-    kg = DirectSPARQLKGClient(sparql_endpoint=endpoint, timeout=120)
+    kg = DirectSPARQLKGClient(sparql_endpoint=endpoint, timeout=15)
 
     results: List[Dict[str, Any]] = []
     processed_ids: set = set()

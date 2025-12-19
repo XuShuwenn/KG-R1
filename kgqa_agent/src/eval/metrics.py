@@ -69,37 +69,59 @@ def exact_match(pred: str, golds: List[str]) -> float:
     return max(_single_exact_match(p, golds) for p in preds)
 
 
-def _single_token_f1_score(pred: str, golds: List[str]) -> float:
-    """Compute F1 for a single prediction string against golds."""
-    if not pred:
-        return 0.0
-    p_tokens = qa_normalize_answer(pred).split()
-    p_set = set(p_tokens)
-    if not p_set:
-        return 0.0
-
-    best = 0.0
-    for g in golds or []:
-        g_tokens = qa_normalize_answer(str(g)).split()
-        g_set = set(g_tokens)
-        if not g_set:
-            continue
-        common = len(p_set & g_set)
-        if common == 0:
-            f1 = 0.0
-        else:
-            prec = common / len(p_set)
-            rec = common / len(g_set)
-            f1 = 2 * prec * rec / (prec + rec)
-        if f1 > best:
-            best = f1
-    return best
-
 def token_f1_score(pred: str, golds: List[str]) -> float:
-    """Compute best F1 across all parsed predictions."""
+    """Compute F1 score using set-based matching.
+    
+    This function:
+    1. Parses the prediction string into multiple candidate answers
+    2. Merges all prediction candidates into a single token set
+    3. Merges all gold answers into a single token set
+    4. Computes F1 between the two token sets
+    
+    Args:
+        pred: Prediction string (may contain multiple candidates)
+        golds: List of gold answer strings
+        
+    Returns:
+        F1 score (0.0 to 1.0) computed between the merged token sets
+    """
+    # Parse prediction into multiple candidates
     preds = parse_prediction(pred)
     if not preds:
         return 0.0
-    return max(_single_token_f1_score(p, golds) for p in preds)
+    
+    # Merge all prediction candidates into a single token set
+    pred_tokens = set()
+    for p in preds:
+        normalized = qa_normalize_answer(p)
+        tokens = normalized.split()
+        pred_tokens.update(tokens)
+    
+    if not pred_tokens:
+        return 0.0
+    
+    # Merge all gold answers into a single token set
+    gold_tokens = set()
+    for g in golds or []:
+        normalized = qa_normalize_answer(str(g))
+        tokens = normalized.split()
+        gold_tokens.update(tokens)
+    
+    if not gold_tokens:
+        return 0.0
+    
+    # Compute F1 between the two token sets
+    common = len(pred_tokens & gold_tokens)
+    if common == 0:
+        return 0.0
+    
+    precision = common / len(pred_tokens)
+    recall = common / len(gold_tokens)
+    
+    if precision + recall == 0:
+        return 0.0
+    
+    f1 = 2 * precision * recall / (precision + recall)
+    return f1
 
 f1_score = token_f1_score

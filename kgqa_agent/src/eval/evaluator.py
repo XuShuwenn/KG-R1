@@ -75,7 +75,7 @@ def run_evaluation(dataset_path: str, *,
         model="gpt-4o-mini",  # Default filter model (lightweight, fast)
         temperature=0.0,  # Deterministic filtering (no randomness)
         max_tokens=4096,  # Sufficient for relation filtering responses
-        timeout=30.0  # 30 second timeout (shorter than main model to fail fast)
+        timeout=15.0  # Unified 15s timeout (shorter than main model to fail fast)
     ))
 
     def create_model():

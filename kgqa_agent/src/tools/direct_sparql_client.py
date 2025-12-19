@@ -28,7 +28,7 @@ def _setup_sparql_no_proxy():
 class DirectSPARQLKGClient:
     """SPARQL client: resolves entity names, queries Virtuoso, ranks results."""
     
-    def __init__(self, sparql_endpoint: str = "http://localhost:18890/sparql", timeout: int = 60, 
+    def __init__(self, sparql_endpoint: str = "http://localhost:18890/sparql", timeout: int = 15, 
                  llm_filter_callback: Optional[Any] = None):
         """Init client with endpoint and timeout; set up resolver and caches.
         
@@ -231,6 +231,7 @@ class DirectSPARQLKGClient:
                 rel_ids = set()
                 
                 # 1. Outgoing relations
+                import time
                 query_out = f"""
                 PREFIX ns: <http://rdf.freebase.com/ns/>
                 SELECT DISTINCT ?relation WHERE {{
@@ -239,8 +240,12 @@ class DirectSPARQLKGClient:
                     FILTER(STRSTARTS(STR(?relation), "http://rdf.freebase.com/ns/"))
                 }} LIMIT {limit}
                 """
+                logger.debug(f"[SPARQL] Executing outgoing relations query for {entity_id}...")
+                query_start = time.time()
                 self.sparql.setQuery(query_out)
                 results_out = self.sparql.query().convert()
+                query_elapsed = time.time() - query_start
+                logger.debug(f"[SPARQL] Outgoing relations query completed in {query_elapsed:.2f}s")
                 for b in results_out.get("results", {}).get("bindings", []):
                     val = b.get("relation", {}).get("value")
                     if val:
@@ -255,8 +260,12 @@ class DirectSPARQLKGClient:
                     FILTER(STRSTARTS(STR(?relation), "http://rdf.freebase.com/ns/"))
                 }} LIMIT {limit}
                 """
+                logger.debug(f"[SPARQL] Executing incoming relations query for {entity_id}...")
+                query_start = time.time()
                 self.sparql.setQuery(query_in)
                 results_in = self.sparql.query().convert()
+                query_elapsed = time.time() - query_start
+                logger.debug(f"[SPARQL] Incoming relations query completed in {query_elapsed:.2f}s")
                 for b in results_in.get("results", {}).get("bindings", []):
                     val = b.get("relation", {}).get("value")
                     if val:

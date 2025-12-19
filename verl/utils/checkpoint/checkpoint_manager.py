@@ -95,7 +95,7 @@ class BaseCheckpointManager:
         lock_path = os.path.join(tempfile.gettempdir(), lock_filename)
 
         try:
-            with FileLock(lock_path, timeout=60):  # Add timeout
+            with FileLock(lock_path, timeout=15):  # Add timeout
                 # make a new dir
                 os.makedirs(path, exist_ok=True)
         except Exception as e:

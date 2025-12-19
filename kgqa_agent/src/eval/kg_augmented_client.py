@@ -65,10 +65,10 @@ class KGAugmentedModelClient(BaseModelClient):
         from ..tools.direct_sparql_client import DirectSPARQLKGClient
         endpoint = kg_server_url if kg_server_url.endswith("/sparql") else f"{kg_server_url}/sparql"
         # Pass LLM filter callback to DirectSPARQLKGClient for CVT flatten relation filtering
-        # Use increased timeout (120s) to reduce timeout-related exceptions
+        # Unified timeout to 15s to match repo-wide default
         self.kg_client = DirectSPARQLKGClient(
             sparql_endpoint=endpoint,
-            timeout=120,
+            timeout=15,
             llm_filter_callback=self._filter_relations_with_llm
         )
     

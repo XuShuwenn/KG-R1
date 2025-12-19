@@ -12,12 +12,15 @@ Reward Structure:
 
 import torch
 import numpy as np
+import re
 from typing import Dict, List, Any, Tuple, Optional
 from collections import defaultdict
 
 from .kg_format import KGFormatRewardManager
 from verl.utils.reward_score.qa_em_format_kg import normalize_answer, is_retrieval_correct_kg, extract_answer_kg, em_check_kg, extract_assistant_response
 from kg_r1.search.error_types import KGErrorType
+import json
+import re
 
 # Removed enhanced_metrics imports - using entity-level calculations only
 
@@ -45,6 +48,25 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             'exact_match': reward_kwargs.get('global_exact_match', 0.3),
             'retrieval_quality': reward_kwargs.get('global_retrieval_quality', 0.4),
         }
+
+        self.kgqa_reward_profile = reward_kwargs.get('kgqa_reward_profile', False)
+        if not self.kgqa_reward_profile:
+            data_source_hint = str(reward_kwargs.get('data_source', '')).lower()
+            if 'kgqa_agent' in data_source_hint or 'kgqa' in data_source_hint:
+                self.kgqa_reward_profile = True
+        if self.kgqa_reward_profile:
+            if 'turn_format_score' not in reward_kwargs:
+                self.turn_specific_weights['format_score'] = 0.1
+            if 'turn_kg_query_validity' not in reward_kwargs:
+                self.turn_specific_weights['kg_query_validity'] = 0.05
+            if 'turn_is_answer_score' not in reward_kwargs:
+                self.turn_specific_weights['is_answer_score'] = 0.05
+            if 'global_exact_match' not in reward_kwargs:
+                self.global_weights['exact_match'] = 0.5
+            if 'global_retrieval_quality' not in reward_kwargs:
+                self.global_weights['retrieval_quality'] = 0.3
+            if self.verbose:
+                print("[MultiTurnReward] Applying kgqa_reward_profile weight overrides")
         
         self.verbose = reward_kwargs.get('verbose', False)
         
@@ -399,6 +421,15 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         # This turn produced an answer - return 1.0 (binary reward)
         return 1.0
     
+    @staticmethod
+    def _strip_chatml_wrappers(content: str) -> str:
+        if not content:
+            return ""
+        content = re.sub(r"<\|im_start\|>[^>]*?>", "", content)
+        content = content.replace("<|im_end|>", "")
+        content = content.replace("<s>", "").replace("</s>", "")
+        return content.strip()
+
     def _calculate_turn_format_score_reward(self, turn_info: Dict, full_response: str, data_item=None, sample_idx: int = 0, sample_interaction_history: Dict = None) -> float:
         """
         Calculate turn-wise format score reward using server-based indexing.
@@ -435,6 +466,8 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         turn_content = self._extract_turn_content_server_interaction(turn_info, sample_interaction_history)
         
         # If server interaction extraction fails, fall back to tensor-based extraction
+        turn_content = self._strip_chatml_wrappers(turn_content)
+
         if not turn_content:
             return (0.0, "")
                 
@@ -950,6 +983,105 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
     
     
     
+    def _is_kgqa_agent_mode(self, interaction_history: Dict) -> bool:
+        """Check if we should use kgqa_agent-style metrics calculation."""
+        data_source = str(interaction_history.get('data_source', '')).lower()
+        # Check for kgqa_agent data sources (typically cwq_kgqa_agent_format, webqsp_kgqa_agent_format, etc.)
+        return 'kgqa_agent' in data_source or 'kgqa_agent_format' in data_source
+    
+    def _qa_normalize_answer(self, s: str) -> str:
+        """kgqa_agent-style normalization: lowercase, remove 'a'/'an', normalize whitespace, but keep punctuation."""
+        s = s.lower()
+        s = re.sub(r"\b(a|an)\b", " ", s)
+        s = " ".join(s.split())
+        return s
+    
+    def _parse_prediction_kgqa_agent(self, pred: str) -> List[str]:
+        """Parse prediction following kgqa_agent logic: support JSON list, pipe-separated, or single string."""
+        if not pred:
+            return []
+        clean = pred.strip()
+        
+        # Try parsing as JSON list
+        try:
+            parsed = json.loads(clean)
+            if isinstance(parsed, list):
+                return [str(p).strip() for p in parsed if p]
+            return [str(parsed).strip()]
+        except json.JSONDecodeError:
+            pass
+        
+        # Fallback for pipe separators: "A | B | C"
+        if "|" in clean:
+            return [p.strip() for p in clean.split("|") if p.strip()]
+        
+        # Fallback: return the whole prediction as single candidate
+        return [clean]
+    
+    def _exact_match_kgqa_agent(self, pred: str, golds: List[str]) -> float:
+        """kgqa_agent-style exact match: supports bidirectional substring matching."""
+        preds = self._parse_prediction_kgqa_agent(pred)
+        if not preds:
+            return 0.0
+        
+        # Try each parsed prediction candidate
+        for p in preds:
+            npred = self._qa_normalize_answer(p)
+            for g in golds:
+                ngold = self._qa_normalize_answer(str(g))
+                # Exact match
+                if npred == ngold:
+                    return 1.0
+                # Gold in prediction (substring)
+                if ngold in npred:
+                    return 1.0
+                # Prediction in gold (reverse substring)
+                if npred and npred in ngold:
+                    return 1.0
+        
+        return 0.0
+    
+    def _token_f1_score_kgqa_agent(self, pred: str, golds: List[str]) -> Dict[str, float]:
+        """kgqa_agent-style token F1: merge all prediction candidates and gold answers into token sets."""
+        preds = self._parse_prediction_kgqa_agent(pred)
+        if not preds:
+            return {'f1': 0.0, 'precision': 0.0, 'recall': 0.0}
+        
+        # Merge all prediction candidates into a single token set
+        pred_tokens = set()
+        for p in preds:
+            normalized = self._qa_normalize_answer(p)
+            tokens = normalized.split()
+            pred_tokens.update(tokens)
+        
+        if not pred_tokens:
+            return {'f1': 0.0, 'precision': 0.0, 'recall': 0.0}
+        
+        # Merge all gold answers into a single token set
+        gold_tokens = set()
+        for g in golds or []:
+            normalized = self._qa_normalize_answer(str(g))
+            tokens = normalized.split()
+            gold_tokens.update(tokens)
+        
+        if not gold_tokens:
+            return {'f1': 0.0, 'precision': 0.0, 'recall': 0.0}
+        
+        # Compute F1 between the two token sets
+        common = len(pred_tokens & gold_tokens)
+        if common == 0:
+            return {'f1': 0.0, 'precision': 0.0, 'recall': 0.0}
+        
+        precision = common / len(pred_tokens)
+        recall = common / len(gold_tokens)
+        
+        if precision + recall == 0:
+            f1 = 0.0
+        else:
+            f1 = 2 * precision * recall / (precision + recall)
+        
+        return {'f1': f1, 'precision': precision, 'recall': recall}
+    
     def _calculate_exact_match_reward(self, data_item, interaction_history: Dict) -> float:
         """
         Calculate exact match reward for final answer with enhanced metrics.
@@ -992,50 +1124,26 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         # Extract the final answer from assistant response
         predicted_answer = extract_answer_kg(assistant_response)
         
-        # Add logging for all KG evaluation examples
-        # Determine dataset type from interaction history
-        dataset_type = 'UNKNOWN'
-        data_source = str(interaction_history.get('data_source', '')).lower()
+        # Check if we should use kgqa_agent-style metrics
+        use_kgqa_agent_metrics = self._is_kgqa_agent_mode(interaction_history)
         
-        # Determine dataset type from data_source
-        extra_info = interaction_history.get('extra_info', {})
+        if use_kgqa_agent_metrics:
+            # Use kgqa_agent-style metrics
+            entity_level_exact_match = self._exact_match_kgqa_agent(predicted_answer or "", ground_truth_answers)
+            entity_metrics = self._token_f1_score_kgqa_agent(predicted_answer or "", ground_truth_answers)
+            entity_level_f1 = entity_metrics['f1']
+            entity_level_precision = entity_metrics['precision']
+            entity_level_recall = entity_metrics['recall']
+        else:
+            # Use original KG-R1 metrics (with MultiTQ handling, etc.)
+            data_source = str(interaction_history.get('data_source', '')).lower()
+            entity_level_exact_match = self._calculate_entity_level_match(predicted_answer, ground_truth_answers, interaction_history=interaction_history, dataset_name=data_source)
+            entity_metrics = self._calculate_entity_level_f1_precision_recall(predicted_answer, ground_truth_raw)
+            entity_level_f1 = entity_metrics['f1']
+            entity_level_precision = entity_metrics['precision']
+            entity_level_recall = entity_metrics['recall']
         
-        if 'multitq' in data_source:
-            dataset_type = 'MultiTQ'
-        elif 'cwq' in data_source:
-            dataset_type = 'CWQ'
-        elif 'webqsp' in data_source:
-            dataset_type = 'WebQSP'
-        elif 'simpleqa' in data_source:
-            dataset_type = 'SimpleQA'
-        elif 'trex' in data_source:
-            dataset_type = 'T-REx'
-        elif 'zero_shot_re' in data_source:
-            dataset_type = 'ZeroShotRE'
-        # Fallback: check extra_info if data_source didn't match
-        elif extra_info and 'dataset_name' in extra_info and extra_info['dataset_name'] == 'multitq':
-            dataset_type = 'MultiTQ'
-            data_source = 'multitq'  # Update for consistency
-        
-        # Calculate EM score for display (no logging)
-        # Pass interaction_history to enable MultiTQ temporal granularity handling
-        em_match_result = self._check_exact_match(predicted_answer, ground_truth_answers, interaction_history=interaction_history, dataset_name=data_source)
-        em_score = 1.0 if em_match_result else 0.0
-        
-        # Token-level enhanced metrics removed - using entity-level calculations only
-        
-        # Always calculate entity-level metrics for both exact match and F1
-        # Pass interaction_history and dataset info to enable MultiTQ temporal handling
-        entity_level_exact_match = self._calculate_entity_level_match(predicted_answer, ground_truth_answers, interaction_history=interaction_history, dataset_name=data_source)
-        
-        # Calculate proper entity-level F1, precision, and recall
-        # Pass raw ground truth to properly handle multi-entity cases
-        entity_metrics = self._calculate_entity_level_f1_precision_recall(predicted_answer, ground_truth_raw)
-        entity_level_f1 = entity_metrics['f1']
-        entity_level_precision = entity_metrics['precision']  
-        entity_level_recall = entity_metrics['recall']
-        
-        # Store metrics for WandB logging - all entity-level
+        # Store metrics for WandB logging
         if not hasattr(data_item, 'answer_metrics'):
             data_item.answer_metrics = {}
         
@@ -1046,27 +1154,25 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             'recall': float(entity_level_recall)
         })
         
-        # Choose score based on answer score mode - both use entity-level calculation
+        # Choose score based on answer score mode
         if self.answer_score_mode == 'binary':
-            # Binary mode: use entity-level exact match score
             final_score = entity_level_exact_match
         elif self.answer_score_mode == 'f1':
-            # F1 mode: use entity-level F1 score 
             final_score = entity_level_f1
         else:
-            # Unknown mode, fallback to binary
             if self.verbose:
                 print(f"[exact_match] Warning: unknown answer_score_mode '{self.answer_score_mode}', falling back to binary")
             final_score = entity_level_exact_match
         
         # Show enhanced metrics in verbose mode
         if self.verbose and (entity_level_exact_match > 0 or final_score > 0 or self.show_full_responses):
-            print(f"\n[enhanced_exact_match_details] mode={self.answer_score_mode}")
+            mode_str = "kgqa_agent" if use_kgqa_agent_metrics else "kg-r1"
+            print(f"\n[enhanced_exact_match_details] mode={self.answer_score_mode}, metric_style={mode_str}")
             print(f"  [entity_exact_match] {entity_level_exact_match:.1f}")
             reward_source = 'entity_exact_match' if self.answer_score_mode == 'binary' else 'entity_f1'
             print(f"  [final_score] {final_score:.1f} (from {reward_source})")
             print(f"  [predicted] '{predicted_answer}'")
-            print(f"  [expected] {ground_truth_answers[:2]}...")  # Show first 2
+            print(f"  [expected] {ground_truth_answers[:2]}...")
             if self.show_full_responses:
                 print(f"\n[full_assistant_response]")
                 print(assistant_response)

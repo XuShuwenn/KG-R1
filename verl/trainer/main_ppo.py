@@ -32,6 +32,7 @@ def run_ppo(config) -> None:
         ray.init(
             runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"}},
             num_cpus=config.ray_init.num_cpus,
+            include_dashboard=False,  # Disable dashboard to avoid MetricsHead startup errors
         )
 
     runner = TaskRunner.remote()
@@ -45,6 +46,11 @@ def run_ppo(config) -> None:
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
     def run(self, config):
+        # Suppress FSDP warnings about NO_SHARD and full_state_dict
+        import warnings
+        warnings.filterwarnings("ignore", message=".*NO_SHARD.*full_state_dict.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=".*full_state_dict willbe returned.*", category=UserWarning)
+        
         # print initial config
         from pprint import pprint
 

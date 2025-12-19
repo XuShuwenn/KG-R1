@@ -4,6 +4,7 @@
 pip3 install --no-deps -e .
 python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-deps "tensordict>=0.8.0,<=0.10.0,!=0.9.0"
 python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pyvers
+python -m pip install -r requirements.txt
 
 # 从 .env 文件读取 WANDB_KEY 并登录 wandb
 if [ -f .env ]; then

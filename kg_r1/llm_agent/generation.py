@@ -2,8 +2,9 @@ import torch
 import re
 from collections import defaultdict
 import os
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .tensor_helper import TensorHelper, TensorConfig
 from verl import DataProto
 from verl.utils.tracking import Tracking
@@ -13,6 +14,21 @@ import json # Added for parsing JSON queries and formatting fallback
 from functools import lru_cache
 from kg_r1.search.error_types import KGErrorType
 from kg_r1.kgqa_bridge import KGQASparqlAdapter
+
+# Import prompt utilities for continuation and force-answer prompts
+try:
+    from verl.trainer.ppo.prompts import build_continuation_prompt, FORCE_ANSWER_PROMPT
+except ImportError:
+    # Fallback to kgqa_agent prompts if verl is not available
+    try:
+        from kgqa_agent.prompts.prompts import build_continuation_prompt, FORCE_ANSWER_PROMPT
+    except ImportError:
+        # Define fallback functions if both imports fail
+        def build_continuation_prompt(query_results: str) -> str:
+            return f'<information>Here are the query results:\n{query_results}\n</information>\n\nReview the results. If the answer is found, provide it in <answer> tags. Otherwise, continue reasoning in <think> tags and issue your next <kg-query>.\n\nReminder: After `get_relations`, you must rank all returned relations and call `get_triples` with the full ranked list. We will execute a query for the top 4.\n\n<think>'
+        FORCE_ANSWER_PROMPT = """You have reached the maximum number of queries. Based on the information gathered, provide your final answer in <answer> tags.
+Strict Format: <answer>["Answer1", "Answer2"]</answer>. The answer(s) must be concise entity names copied exactly from the KG results.
+"""
 
 @dataclass
 class GenerationConfig:
@@ -35,6 +51,9 @@ class GenerationConfig:
     kgqa_relation_filter_model: str = None
     kgqa_max_calls: int = None
     kgqa_top_k: int = None
+    kgqa_timeout: int = 15  # Timeout for SPARQL queries (seconds)
+    kgqa_thread_pool_size: int = 40  # Max workers for per-turn SPARQL parallelism
+    kgqa_thread_timeout: Optional[float] = None  # Optional timeout per query future
 
 class LLMGenerationManager:
     def __init__(
@@ -53,6 +72,12 @@ class LLMGenerationManager:
         self.config = config
         self.is_validation = is_validation
         self.use_sparql_bridge = bool(config.use_sparql_bridge)
+        self.kgqa_thread_pool_size = max(
+            1, int(getattr(config, "kgqa_thread_pool_size", 40) or 40)
+        )
+        self.kgqa_thread_timeout = getattr(config, "kgqa_thread_timeout", None)
+        # Store kgqa_timeout for fallback when thread_timeout is None
+        self.kgqa_timeout = getattr(config, "kgqa_timeout", 15) or 15
         self.kgqa_adapter: KGQASparqlAdapter | None = None
         if self.use_sparql_bridge:
             adapter_endpoint = config.sparql_endpoint or config.search_url
@@ -61,8 +86,10 @@ class LLMGenerationManager:
             adapter_top_k = config.kgqa_top_k or config.topk
             adapter_max_calls = config.kgqa_max_calls or 10  # Default to 10 if not specified
             adapter_filter_model = config.kgqa_relation_filter_model
+            adapter_timeout = config.kgqa_timeout or 15  # Default to 15s if not specified
             self.kgqa_adapter = KGQASparqlAdapter(
                 sparql_endpoint=adapter_endpoint,
+                timeout=adapter_timeout,
                 kg_top_k=adapter_top_k,
                 max_calls=adapter_max_calls,
                 relation_filter_model=adapter_filter_model,
@@ -72,7 +99,7 @@ class LLMGenerationManager:
             )
             print(
                 f"[KG_BRIDGE] Initialized kgqa_agent SPARQL adapter @ {adapter_endpoint} "
-                f"(max_calls={adapter_max_calls}, relation_filter_model={filter_msg})"
+                f"(max_calls={adapter_max_calls}, timeout={adapter_timeout}s, relation_filter_model={filter_msg})"
             )
         
         # Track if we've already logged routing for each dataset
@@ -225,7 +252,7 @@ class LLMGenerationManager:
     def _init_regex_patterns(self):
         """Pre-compile all regex patterns for performance optimization."""
         # Patterns for postprocess_predictions
-        self.search_pattern = re.compile(r'<search>(.*?)</search>', re.DOTALL)
+        # Note: <search> tag is not a valid tag in kgqa_agent mode, removed
         self.kg_query_pattern1 = re.compile(r'<kg-query>(.*?)</kg-query>', re.DOTALL)  
         self.kg_query_pattern2 = re.compile(r'<kg-query\s+([^>]+)\s*/>', re.DOTALL)
         self.answer_pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
@@ -596,10 +623,16 @@ class LLMGenerationManager:
         
         print(f"[DEBUG-INTERACTION] Created interaction_history with data_source info: {[h['data_source'] for h in interaction_history[:3]]}...")
 
-        # Main generation loop - continue until all samples are done (no turn limit, only query count limit)
-        step = 0
-        while active_mask.sum():
-            step += 1
+        # Main generation loop - enforce max_turns limit to prevent infinite loops
+        # The loop will continue until:
+        # 1. All samples are done (active_mask.sum() == 0), OR
+        # 2. max_turns is reached (then force final answer)
+        for step in range(self.config.max_turns):
+            if not active_mask.sum():
+                break
+            active_count = active_mask.sum().item()
+            print(f"[DEBUG-GENERATION] Step {step+1}/{self.config.max_turns}: {active_count}/{actual_batch_size} samples active")
+            
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
@@ -610,7 +643,9 @@ class LLMGenerationManager:
                 k: v[active_mask] for k, v in rollings.batch.items()
             })
             
+            print(f"[DEBUG-GENERATION] Step {step+1}: Calling _generate_with_gpu_padding for {active_count} samples...")
             gen_output = self._generate_with_gpu_padding(rollings_active)
+            print(f"[DEBUG-GENERATION] Step {step+1}: Generation completed")
 
             meta_info = gen_output.meta_info            
             responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
@@ -621,9 +656,11 @@ class LLMGenerationManager:
             # Note: The batch is already expanded on the trainer side for multiple rollouts
             # When max_calls is reached, execute_predictions will return FORCE_ANSWER_PROMPT in next_obs
             # and the model should respond with <answer> tag, which will set done=True
+            print(f"[DEBUG-GENERATION] Step {step+1}: Calling execute_predictions for {active_count} samples...")
             next_obs, dones, valid_action, is_search, raw_server_responses = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, gen_batch.meta_info, active_mask
             )
+            print(f"[DEBUG-GENERATION] Step {step+1}: execute_predictions completed, {sum(dones)}/{active_count} samples done")
             
             # Store interaction details for this turn
             cur_actions, _, cur_reasonings = self.postprocess_predictions(responses_str)
@@ -672,6 +709,77 @@ class LLMGenerationManager:
                 turn_idx=step,
                 active_mask=active_mask
             )
+        
+        # Final turn: if any samples are still active after max_turns, force them to answer
+        # This prevents infinite loops when models don't output <answer> or don't query
+        if active_mask.sum():
+            active_count = active_mask.sum().item()
+            print(f"[DEBUG-GENERATION] Final turn after {self.config.max_turns} turns: {active_count}/{actual_batch_size} samples still active, forcing answer...")
+            
+            rollings.batch = self.tensor_fn.cut_to_effective_len(
+                rollings.batch,
+                keys=['input_ids', 'attention_mask', 'position_ids']
+            )
+            
+            rollings_active = DataProto.from_dict({
+                k: v[active_mask] for k, v in rollings.batch.items()
+            })
+            
+            gen_output = self._generate_with_gpu_padding(rollings_active)
+            meta_info = gen_output.meta_info
+            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
+            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+            
+            # Final turn: do_search=False to prevent further queries, force answer
+            next_obs, dones, valid_action, is_search, raw_server_responses = self.execute_predictions(
+                responses_str, self.tokenizer.pad_token, gen_batch.meta_info, active_mask, do_search=False
+            )
+            
+            # Store final turn interaction details
+            cur_actions, _, cur_reasonings = self.postprocess_predictions(responses_str)
+            for i in range(actual_batch_size):
+                if active_mask[i]:
+                    reasoning_entry = cur_reasonings[i] if i < len(cur_reasonings) else ""
+                    interaction_history[i]["actions"].append(cur_actions[i])
+                    interaction_history[i]["search_results"].append(next_obs[i])
+                    interaction_history[i]["valid_actions"].append(valid_action[i])
+                    interaction_history[i]["is_search_actions"].append(is_search[i])
+                    interaction_history[i]["responses_str"].append(responses_str[i])
+                    interaction_history[i]["reasonings"].append(reasoning_entry)
+                    interaction_history[i]["raw_server_responses"].append(raw_server_responses[i])
+                else:
+                    interaction_history[i]["actions"].append("")
+                    interaction_history[i]["search_results"].append("")
+                    interaction_history[i]["valid_actions"].append(0)
+                    interaction_history[i]["is_search_actions"].append(0)
+                    interaction_history[i]["responses_str"].append("")
+                    interaction_history[i]["reasonings"].append("")
+                    interaction_history[i]["raw_server_responses"].append({})
+            
+            curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
+            active_mask = active_mask * curr_active_mask
+            active_num_list.append(active_mask.sum().item())
+            
+            turns_stats[curr_active_mask] += 1
+            valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
+            valid_search_stats += torch.tensor(is_search, dtype=torch.int)
+            
+            next_obs_ids = self._process_next_obs(next_obs)
+            
+            rollings = self._update_rolling_state(
+                rollings,
+                responses_ids,
+                next_obs_ids
+            )
+            original_right_side = self._update_right_side(
+                original_right_side,
+                responses_ids,
+                next_obs_ids,
+                turn_idx=self.config.max_turns,
+                active_mask=active_mask
+            )
+            
+            print(f"[DEBUG-GENERATION] Final turn completed: {sum(dones)}/{active_count} samples done")
         
         meta_info['turns_stats'] = turns_stats.tolist()
         meta_info['active_mask'] = active_mask.tolist()
@@ -800,24 +908,31 @@ class LLMGenerationManager:
         cur_actions, contents, _ = self.postprocess_predictions(predictions)
         session_keys = self._build_bridge_session_keys(meta_info, len(cur_actions)) if self.use_sparql_bridge else []
         
-        # Check for responses that exceed max_prompt_length and mark them as invalid
+        # Check for responses that exceed max_response_length and mark them as invalid
+        # Note: In kgqa_agent mode (use_sparql_bridge=True), we don't check response length
+        # to match kgqa_agent's behavior (it only uses max_tokens from model config)
         response_length_exceeded = []
-        for i, prediction in enumerate(predictions):
-            # Tokenize the response to check its length
-            response_tokens = self.tokenizer(
-                prediction, 
-                add_special_tokens=False, 
-                return_tensors='pt'
-            )['input_ids']
-            response_length = response_tokens.shape[1]
-            
-            if response_length > self.config.max_response_length:
-                response_length_exceeded.append(True)
-                # Override action to be invalid if response is too long
-                cur_actions[i] = 'error'
-                contents[i] = f'Response too long ({response_length} > {self.config.max_response_length} tokens)'
-            else:
-                response_length_exceeded.append(False)
+        if not self.use_sparql_bridge:
+            # Only check response length in non-kgqa_agent mode
+            for i, prediction in enumerate(predictions):
+                # Tokenize the response to check its length
+                response_tokens = self.tokenizer(
+                    prediction, 
+                    add_special_tokens=False, 
+                    return_tensors='pt'
+                )['input_ids']
+                response_length = response_tokens.shape[1]
+                
+                if response_length > self.config.max_response_length:
+                    response_length_exceeded.append(True)
+                    # Override action to be invalid if response is too long
+                    cur_actions[i] = 'error'
+                    contents[i] = f'Response too long ({response_length} > {self.config.max_response_length} tokens)'
+                else:
+                    response_length_exceeded.append(False)
+        else:
+            # In kgqa_agent mode, don't check response length (match kgqa_agent behavior)
+            response_length_exceeded = [False] * len(predictions)
         
         next_obs, dones, valid_action, is_search = [], [], [], []
         raw_server_responses = []
@@ -854,9 +969,7 @@ class LLMGenerationManager:
         for idx, (sample_idx, _) in enumerate(kg_queries_with_indices):
             kg_response_map[sample_idx] = (kg_results[idx], raw_kg_responses[idx])
         
-        # Handle search actions (return "not implemented" message)
-        search_queries_count = sum([1 for action in cur_actions if action == 'search'])
-        search_results = ["The search server has not been implemented. Please use <kg-query> with function calls instead."] * search_queries_count
+        # Note: <search> tag is not a valid tag in kgqa_agent mode, removed
         for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
             
             if not active:
@@ -885,16 +998,23 @@ class LLMGenerationManager:
                         )
                         
                         if is_max_calls_reached:
-                            # Max calls reached: return FORCE_ANSWER_PROMPT and set done=True
-                            # This forces the model to answer in the next turn (which will be the last)
-                            next_obs.append(f'\n\n<information>{kg_result.strip()}</information>\n\n')
+                            # Max calls reached: use FORCE_ANSWER_PROMPT to force model to answer
+                            # Build continuation prompt with the last query results (includes <information> tags)
+                            continuation = build_continuation_prompt(kg_result.strip())
+                            # Append FORCE_ANSWER_PROMPT after continuation to force answer
+                            # Note: continuation already includes <information> and guidance text
+                            next_obs.append(f'\n\n{continuation}\n\n{FORCE_ANSWER_PROMPT}')
                             raw_server_responses.append(raw_kg_response)
                             dones.append(1)  # Force done to end conversation after model answers
                             valid_action.append(1)  # The query itself was valid
                             is_search.append(1)
                         else:
-                            # Normal query: continue conversation
-                            next_obs.append(f'\n\n<information>{kg_result.strip()}</information>\n\n')
+                            # Normal query: continue conversation using CONTINUATION_PROMPT_TEMPLATE
+                            # This includes <information> tags and guidance text
+                            continuation = build_continuation_prompt(kg_result.strip())
+                            # The continuation prompt already includes <information> and guidance text
+                            # Add <think> tag at the end to guide model thinking
+                            next_obs.append(f'\n\n{continuation}\n\n<think>')
                             raw_server_responses.append(raw_kg_response)
                             dones.append(0)  # Continue conversation
                             # Fix: KG queries are invalid if search is disabled (final turn)
@@ -910,25 +1030,23 @@ class LLMGenerationManager:
                         dones.append(0)
                         valid_action.append(0)
                         is_search.append(1)
-                elif action == 'search':
-                    next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
-                    dones.append(0)
-                    valid_action.append(1)
-                    is_search.append(1)
-                    raw_server_responses.append({"success": False, "action": "search", "kg_metadata": {"success": False, "error_type": KGErrorType.FORMAT_ERROR}})  # Mock response for search
+                # Note: <search> tag is not a valid tag in kgqa_agent mode, removed
+                # If model outputs <search>, it will be treated as 'error' action
                 else:
                     # Check if this is a length-exceeded response
                     if response_length_exceeded[i]:
-                        next_obs.append(f'\n\n<information>Your previous response was too long ({contents[i]}). Please provide shorter responses within the token limit.</information>\n\n')
+                        # Add <think> tag after information to guide model thinking
+                        next_obs.append(f'\n\n<information>Your previous response was too long ({contents[i]}). Please provide shorter responses within the token limit.</information>\n\n<think>')
                     else:
-                        next_obs.append(f'\n\n<information>Your previous action is invalid. You should put the query between <kg-query> and </kg-query> if you want to search, or put the answer between <answer> and </answer> if you want to give the final answer.</information>\n\n')
+                        # Add <think> tag after information to guide model thinking
+                        next_obs.append(f'\n\n<information>Your previous action is invalid. You should put the query between <kg-query> and </kg-query> if you want to search, or put the answer between <answer> and </answer> if you want to give the final answer.</information>\n\n<think>')
                     dones.append(0)
                     valid_action.append(0)
                     is_search.append(0)
                     raw_server_responses.append({"success": False, "action": "invalid", "kg_metadata": {"success": False, "error_type": KGErrorType.FORMAT_ERROR}})
             
         # CRITICAL FIX: Remove assertion since we're using mapping now
-        assert len(search_results) == 0
+        # Note: search_results removed since <search> tag is not valid in kgqa_agent mode
 
         if self.use_sparql_bridge and session_keys:
             for idx, done in enumerate(dones):
@@ -956,8 +1074,45 @@ class LLMGenerationManager:
         for prediction in predictions:
             if isinstance(prediction, str): # for llm output
                 # Extract reasoning/think content (if present)
-                reasoning_match = self.think_pattern.search(prediction) if hasattr(self, "think_pattern") else None
-                reasonings.append(reasoning_match.group(1).strip() if reasoning_match else "")
+                # We manually add <think> tag after information, so we need to handle:
+                # 1. Model outputs complete <think>...</think> tag pair (need to deduplicate)
+                # 2. Model outputs only </think> closing tag (opening tag was from our prompt)
+                # 3. Model outputs no redacted_reasoning tag at all
+                
+                reasoning_text = ""
+                
+                if hasattr(self, "think_pattern"):
+                    # First, try to match complete tag pair <think>...</think>
+                    complete_match = self.think_pattern.search(prediction)
+                    
+                    if complete_match:
+                        # Model output a complete tag pair - extract content and deduplicate
+                        # Since we added <think> in the prompt, the model's output might include
+                        # the opening tag again, so we extract the content between tags
+                        reasoning_text = complete_match.group(1).strip()
+                    else:
+                        # Check for closing tag </think> (opening tag was from our prompt)
+                        closing_tag_pattern = re.compile(r'</think>', re.IGNORECASE)
+                        closing_tag_match = closing_tag_pattern.search(prediction)
+                        
+                        if closing_tag_match:
+                            # Extract text before the closing tag
+                            # This is the reasoning content that follows our <think> prompt
+                            text_before_closing = prediction[:closing_tag_match.start()].strip()
+                            
+                            # Remove any duplicate <think> opening tag if model added it
+                            # (deduplication: remove opening tag if present)
+                            text_before_closing = re.sub(r'^<think>\s*', '', text_before_closing, flags=re.IGNORECASE)
+                            
+                            # Heuristic: if text before closing tag is reasonable length and doesn't contain other tags,
+                            # it's likely reasoning content
+                            if text_before_closing and len(text_before_closing) < 500:
+                                # Check if it contains other action tags (if so, it's probably not pure reasoning)
+                                has_action_tags = bool(re.search(r'<(kg-query|answer|search)', text_before_closing, re.IGNORECASE))
+                                if not has_action_tags:
+                                    reasoning_text = text_before_closing
+                
+                reasonings.append(reasoning_text)
 
                 # Determine action based on actual tag order
                 candidates: List[Tuple[str, int, str]] = []
@@ -974,9 +1129,8 @@ class LLMGenerationManager:
                     if kg_query_match2:
                         candidates.append(("kg-query", kg_query_match2.start(), kg_query_match2.group(1).strip()))
 
-                search_match = self.search_pattern.search(prediction)
-                if search_match:
-                    candidates.append(("search", search_match.start(), search_match.group(1).strip()))
+                # Note: <search> tag is not a valid tag in kgqa_agent mode, removed
+                # Only match <answer> and <kg-query> tags
 
                 if candidates:
                     action, _, content = min(candidates, key=lambda item: item[1])
@@ -1029,10 +1183,12 @@ class LLMGenerationManager:
         
         raw_server_responses = []
         if valid_queries:
+            print(f"[DEBUG-KG-SEARCH] batch_search: Processing {len(valid_queries)} KG queries via SPARQL bridge...")
             if self.use_sparql_bridge:
                 kg_server_responses, kg_results = self._batch_search_via_sparql_bridge(
                     valid_queries, valid_meta_infos
                 )
+                print(f"[DEBUG-KG-SEARCH] batch_search: SPARQL bridge completed, got {len(kg_results)} results")
             else:
                 kg_server_responses, kg_results = self._batch_search(valid_queries, valid_meta_infos) # Pass list of meta_infos
             
@@ -1192,7 +1348,7 @@ class LLMGenerationManager:
                     response = requests.post(
                         server_url, 
                         json=server_requests, 
-                        timeout=120,  # Increased timeout for complex Freebase queries (GrailQA)
+                        timeout=15,  # Unified default timeout
                         headers={'Content-Type': 'application/json'}
                     )
                     response.raise_for_status()  # Raise an exception for HTTP errors
@@ -1323,36 +1479,124 @@ class LLMGenerationManager:
         if not self.kgqa_adapter:
             raise RuntimeError("SPARQL bridge requested but adapter is not initialized.")
 
-        raw_payloads: List[Dict[str, Any]] = []
-        formatted_results: List[str] = []
+        query_count = len(search_query_contents)
+        if query_count == 0:
+            return [], []
 
-        for idx, query_content_str in enumerate(search_query_contents):
+        print(
+            f"[DEBUG-KG-SEARCH] _batch_search_via_sparql_bridge: Processing {query_count} queries "
+            f"with up to {self.kgqa_thread_pool_size} threads..."
+        )
+
+        import time
+
+        max_workers = max(1, min(self.kgqa_thread_pool_size, query_count))
+        raw_payloads: List[Optional[Dict[str, Any]]] = [None] * query_count
+        formatted_results: List[Optional[str]] = [None] * query_count
+
+        def _build_error_payload(idx: int, meta_info: Dict[str, Any], error_msg: str) -> Dict[str, Any]:
+            original_sample_id = meta_info.get("sample_id", f"sparql_sample_{idx:06d}")
+            batch_index = meta_info.get("batch_index", idx)
+            session_key = meta_info.get("bridge_session_key") or f"{original_sample_id}__idx_{batch_index}"
+            payload = {
+                "success": False,
+                "error": error_msg,
+                "request_payload": {
+                    "original_sample_id": original_sample_id,
+                    "bridge_session_key": session_key,
+                    "query_index": idx,
+                    "query_str": search_query_contents[idx],
+                },
+                "meta": {
+                    "action": "sparql_exception",
+                    "error_type": KGErrorType.SERVER_ERROR,
+                },
+                "kg_metadata": {
+                    "success": False,
+                    "error_type": KGErrorType.SERVER_ERROR,
+                },
+            }
+            return payload
+
+        def _run_single(idx: int) -> Tuple[int, Dict[str, Any], str]:
+            query_content_str = search_query_contents[idx]
             meta_info = meta_info_list[idx] if idx < len(meta_info_list) else {}
             original_sample_id = meta_info.get("sample_id", f"sparql_sample_{idx:06d}")
             batch_index = meta_info.get("batch_index", idx)
-            session_key = meta_info.get("bridge_session_key")
-            if not session_key:
-                session_key = f"{original_sample_id}__idx_{batch_index}"
-
+            session_key = meta_info.get("bridge_session_key") or f"{original_sample_id}__idx_{batch_index}"
             question_text = meta_info.get("question_text", "")
             topic_entities = meta_info.get("topic_entities")
 
-            formatted, payload = self.kgqa_adapter.run_query(
-                sample_id=session_key,
-                query_str=query_content_str,
-                question=question_text,
-                topic_entities=topic_entities,
+            query_start_time = time.time()
+            print(
+                f"[DEBUG-KG-SEARCH] (threaded) Processing query {idx+1}/{query_count}: "
+                f"{query_content_str[:100]}..."
             )
+            try:
+                formatted, payload = self.kgqa_adapter.run_query(
+                    sample_id=session_key,
+                    query_str=query_content_str,
+                    question=question_text,
+                    topic_entities=topic_entities,
+                )
+                query_elapsed = time.time() - query_start_time
+                # Log slow queries for analysis
+                if query_elapsed > 30:
+                    print(
+                        f"[DEBUG-KG-SEARCH] (threaded) Query {idx+1}/{query_count} completed in {query_elapsed:.2f}s (SLOW - may indicate complex SPARQL queries)"
+                    )
+                else:
+                    print(
+                        f"[DEBUG-KG-SEARCH] (threaded) Query {idx+1}/{query_count} completed in {query_elapsed:.2f}s"
+                    )
+            except Exception as exc:
+                query_elapsed = time.time() - query_start_time
+                error_msg = f"SPARQL error after {query_elapsed:.2f}s: {exc}"
+                print(
+                    f"[DEBUG-KG-SEARCH] (threaded) Query {idx+1}/{query_count} FAILED: {error_msg}"
+                )
+                payload = _build_error_payload(idx, meta_info, error_msg)
+                formatted = "No relations found."
+                return idx, payload, formatted
 
-            # Keep track of original sample id for downstream reward logging
             payload.setdefault("request_payload", {})
             payload["request_payload"].setdefault("original_sample_id", original_sample_id)
             payload["request_payload"].setdefault("bridge_session_key", session_key)
+            payload["request_payload"].setdefault("query_index", idx)
+            return idx, payload, formatted
 
-            raw_payloads.append(payload)
-            formatted_results.append(formatted)
+        # Remove timeout on future.result() to allow successful queries to complete
+        # SPARQLWrapper's internal timeout (15s per query) will still prevent individual queries from hanging
+        # This allows get_triples with multiple relations to complete even if total time exceeds 15s
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(_run_single, idx): idx for idx in range(query_count)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    # No timeout - allow successful queries to complete regardless of duration
+                    result_idx, payload, formatted = future.result()
+                except Exception as exc:
+                    meta_info = meta_info_list[idx] if idx < len(meta_info_list) else {}
+                    error_msg = f"SPARQL future failed: {exc}"
+                    print(f"[DEBUG-KG-SEARCH] (threaded) Query {idx+1}/{query_count} EXCEPTION: {error_msg}")
+                    payload = _build_error_payload(idx, meta_info, error_msg)
+                    formatted = "No relations found."
+                    result_idx = idx
 
-        return raw_payloads, formatted_results
+                raw_payloads[result_idx] = payload
+                formatted_results[result_idx] = formatted
+
+        # Ensure no None remains (should not happen, but guard to avoid crashes)
+        for idx in range(query_count):
+            if raw_payloads[idx] is None or formatted_results[idx] is None:
+                meta_info = meta_info_list[idx] if idx < len(meta_info_list) else {}
+                fallback_msg = "SPARQL query returned no result"
+                raw_payloads[idx] = _build_error_payload(idx, meta_info, fallback_msg)
+                formatted_results[idx] = "No relations found."  # Simple message like kgqa_agent
+
+        return raw_payloads, formatted_results  # type: ignore
 
     def _passages2string(self, kg_server_response_item: Dict[str, Any]) -> str:
         """
@@ -1431,7 +1675,15 @@ class LLMGenerationManager:
     def _create_query_format_error(self, query_content: str, original_error: str) -> str:
         """Create an LLM-friendly error message for query format issues."""
         
-        # Get available actions dynamically from server
+        # For kgqa_agent mode (SPARQL bridge), use get_relations and get_triples
+        if self.use_sparql_bridge:
+            return (
+                f"Invalid query format: '{query_content}'. "
+                f"Use function call format like: get_relations(\"entity\") or get_triples(\"entity\", [\"relation1\", \"relation2\"]). "
+                f"Available functions: get_relations(\"entity\"), get_triples(\"entity\", [\"relation1\", \"relation2\"]). "
+            )
+        
+        # For kg-r1 mode (FastAPI), get available actions dynamically from server
         available_actions = self._get_available_actions_from_server()
         functions_list = ", ".join(available_actions)
         
@@ -1507,11 +1759,20 @@ class LLMGenerationManager:
             
             # Reject single-entity functions with 2+ arguments - should have been caught above
             if action_type in ["get_relations", "get_relations_in", "get_relations_out", "get_head_relations", "get_tail_relations"]:
-                error_msg = (
-                    f"Invalid {action_type} format: '{query_content_str}'. "
-                    f"{action_type} accepts only one entity argument: {action_type}(\"entity\"). "
-                    f"For relation-specific queries, use get_entities_out(\"entity\", \"relation\") or get_entities_in(\"entity\", \"relation\")."
-                )
+                if self.use_sparql_bridge:
+                    # kgqa_agent mode: use get_relations and get_triples
+                    error_msg = (
+                        f"Invalid {action_type} format: '{query_content_str}'. "
+                        f"{action_type} accepts only one entity argument: {action_type}(\"entity\"). "
+                        f"For relation-specific queries, use get_triples(\"entity\", [\"relation1\", \"relation2\"])."
+                    )
+                else:
+                    # kg-r1 mode: use get_entities_out/get_entities_in
+                    error_msg = (
+                        f"Invalid {action_type} format: '{query_content_str}'. "
+                        f"{action_type} accepts only one entity argument: {action_type}(\"entity\"). "
+                        f"For relation-specific queries, use get_entities_out(\"entity\", \"relation\") or get_entities_in(\"entity\", \"relation\")."
+                    )
                 raise ValueError(error_msg)
             
             entity_id = quoted_match.group(2)  # Quotes are automatically removed by the regex groups
@@ -1531,11 +1792,20 @@ class LLMGenerationManager:
             
             # Reject single-entity functions with 2+ arguments - should have been caught above
             if action_type in ["get_relations", "get_relations_in", "get_relations_out", "get_head_relations", "get_tail_relations"]:
-                error_msg = (
-                    f"Invalid {action_type} format: '{query_content_str}'. "
-                    f"{action_type} accepts only one entity argument: {action_type}(\"entity\") or {action_type}(entity). "
-                    f"For relation-specific queries, use get_entities_out(\"entity\", \"relation\") or get_entities_in(\"entity\", \"relation\")."
-                )
+                if self.use_sparql_bridge:
+                    # kgqa_agent mode: use get_relations and get_triples
+                    error_msg = (
+                        f"Invalid {action_type} format: '{query_content_str}'. "
+                        f"{action_type} accepts only one entity argument: {action_type}(\"entity\") or {action_type}(entity). "
+                        f"For relation-specific queries, use get_triples(\"entity\", [\"relation1\", \"relation2\"])."
+                    )
+                else:
+                    # kg-r1 mode: use get_entities_out/get_entities_in
+                    error_msg = (
+                        f"Invalid {action_type} format: '{query_content_str}'. "
+                        f"{action_type} accepts only one entity argument: {action_type}(\"entity\") or {action_type}(entity). "
+                        f"For relation-specific queries, use get_entities_out(\"entity\", \"relation\") or get_entities_in(\"entity\", \"relation\")."
+                    )
                 raise ValueError(error_msg)
             
             entity_id = match.group(2).strip()
@@ -1561,12 +1831,22 @@ class LLMGenerationManager:
             }
         
         # No valid format found - provide clear error message with quoted format examples
-        error_msg = (
-            f"Invalid query format: '{query_content_str}'. "
-            f"Use function call format like: get_relations_in(\"entity\") or get_entities_out(\"entity\", \"relation\"). "
-            f"Available functions: get_relations_in(\"entity\"), get_relations_out(\"entity\"), get_entities_out(\"entity\", \"relation\"), get_entities_in(\"entity\", \"relation\"). "
-            f"Example: get_relations_in(\"Natalie Portman\")"
-        )
+        if self.use_sparql_bridge:
+            # kgqa_agent mode: use get_relations and get_triples
+            error_msg = (
+                f"Invalid query format: '{query_content_str}'. "
+                f"Use function call format like: get_relations(\"entity\") or get_triples(\"entity\", [\"relation1\", \"relation2\"]). "
+                f"Available functions: get_relations(\"entity\"), get_triples(\"entity\", [\"relation1\", \"relation2\"]). "
+                f"Example: get_relations(\"Barack Obama\")"
+            )
+        else:
+            # kg-r1 mode: use get_relations_in/get_relations_out/get_entities_in/get_entities_out
+            error_msg = (
+                f"Invalid query format: '{query_content_str}'. "
+                f"Use function call format like: get_relations_in(\"entity\") or get_entities_out(\"entity\", \"relation\"). "
+                f"Available functions: get_relations_in(\"entity\"), get_relations_out(\"entity\"), get_entities_out(\"entity\", \"relation\"), get_entities_in(\"entity\", \"relation\"). "
+                f"Example: get_relations_in(\"Natalie Portman\")"
+            )
         raise ValueError(error_msg)
 
     def _extract_kg_meta_info_for_queries(self, cur_actions: List[str], meta_info: Dict, active_mask, kg_query_batch_indices: List[int] = None) -> List[Dict]:

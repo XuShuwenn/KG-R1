@@ -78,8 +78,6 @@ from verl.utils.metric import (
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean, pad_sequence_to_length
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.rollout.async_server import AsyncLLMServerManager
-
 # Import Role enum from the original trainer to ensure compatibility
 from verl.trainer.ppo.ray_trainer import Role
 
@@ -740,18 +738,6 @@ class RayPPOTrainer:
         if self.use_search_generation:
             # Allow training to run even if legacy search config is omitted when kg_config drives the flow
             self.search_config = search_config or {}
-            
-            # For KG generation with GRPO, we use trainer-side batch expansion
-            grpo_rollout_n = getattr(config.actor_rollout_ref.rollout, 'grpo_rollout_n', None)
-            original_rollout_n = config.actor_rollout_ref.rollout.n
-            
-            # Determine effective rollout_n (fallback to original rollout.n if grpo_rollout_n doesn't exist)
-            effective_rollout_n = grpo_rollout_n if grpo_rollout_n is not None else original_rollout_n
-            
-            if effective_rollout_n > 1:
-                pass  # GRPO batch expansion will be handled in training loop
-            else:
-                pass  # No batch expansion needed
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -791,6 +777,7 @@ class RayPPOTrainer:
             "relation_filter_model": None,
             "kg_top_k": None,
             "max_calls": None,
+            "kgqa_thread_pool_size": 40,  # Default thread pool size for SPARQL parallelism
         }
 
         if kg_cfg is None:
@@ -1012,15 +999,25 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path, interaction_history=None, conversation_turns=None, topic_entities=None, ground_truth=None):
+        """Dump rollout/validation samples as JSONL.
+        
+        Args:
+            inputs: List of input prompts
+            outputs: List of output responses (can be list of lists for multi-turn, or list of strings)
+            scores: List of reward scores
+            reward_extra_infos_dict: Dict of additional reward information
+            dump_path: Directory to save JSONL files
+            interaction_history: Optional list of interaction histories (one per sample)
+            conversation_turns: Optional list of conversation turns (one per sample), each is a list of dicts with "assistant" and "user" keys
+            topic_entities: Optional list of topic entities (one per sample), each is a list of entity names
+            ground_truth: Optional list of ground truth answers (one per sample), each is a list of answer strings
+        """
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
         n = len(inputs)
         base_data = {
-            "input": inputs,
-            "output": outputs,
             "score": scores,
             "step": [self.global_steps] * n,
         }
@@ -1028,13 +1025,44 @@ class RayPPOTrainer:
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
+        
+        if interaction_history is not None and len(interaction_history) == n:
+            base_data["interaction_history"] = interaction_history
+        
+        if conversation_turns is not None and len(conversation_turns) == n:
+            base_data["conversation_turns"] = conversation_turns
+        
+        if topic_entities is not None and len(topic_entities) == n:
+            base_data["topic_entity"] = topic_entities
+        
+        if ground_truth is not None and len(ground_truth) == n:
+            base_data["ground_truth"] = ground_truth
 
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             for i in range(n):
-                entry = {k: v[i] for k, v in base_data.items()}
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                entry = {k: v[i] if isinstance(v, list) else v for k, v in base_data.items()}
+                
+                ordered_entry = {}
+                if "step" in entry:
+                    ordered_entry["step"] = entry.pop("step")
+                if "score" in entry:
+                    ordered_entry["score"] = entry.pop("score")
+                if "conversation_turns" in entry:
+                    ordered_entry["conversation_turns"] = entry.pop("conversation_turns")
+                
+                # Then interaction_history (detailed info)
+                if "interaction_history" in entry:
+                    ordered_entry["interaction_history"] = entry.pop("interaction_history")
+                
+                # Then all other reward metrics
+                ordered_entry.update(entry)
+                
+                # Format JSON with indentation for better readability
+                # Use indent=2 for pretty printing, ensure_ascii=False to preserve Unicode
+                formatted_json = json.dumps(ordered_entry, ensure_ascii=False, indent=2)
+                f.write(formatted_json + "\n")
 
-        print(f"Dumped generations to {filename}")
+        print(f"Dumped generations to {filename} (with interaction_history: {interaction_history is not None})")
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1109,12 +1137,8 @@ class RayPPOTrainer:
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "multi_modal_data" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
             if "raw_prompt" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 
             # CRITICAL: Add sample_id and dataset_name to the pop list so they get included in test_gen_batch
             # The pop() method returns a NEW DataProto with ONLY the popped keys
@@ -1196,13 +1220,7 @@ class RayPPOTrainer:
                 test_gen_batch_padded.meta_info["dataset_names"] = dataset_names
             
             if not self.use_search_generation:
-                # Use standard generation for validation
-                if not self.async_rollout_mode:
-                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-                else:
-                    self.async_rollout_manager.wake_up()
-                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-                    self.async_rollout_manager.sleep()
+                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
                 # Use search-augmented generation for validation - direct integration approach
                 first_input_ids = test_gen_batch_padded.batch['input_ids'][:, -self.generation_manager.config.max_start_length:].clone().long()
@@ -1494,6 +1512,14 @@ class RayPPOTrainer:
                 topk_value = self.kg_bridge_config.get('kg_top_k')
             topk_value = topk_value or 5
 
+            # Get timeout from search_config, fallback to kg_bridge_config, then default to 15
+            timeout_value = self.search_config.get('timeout')
+            if timeout_value is None:
+                timeout_value = self.kg_bridge_config.get('timeout')
+            timeout_value = timeout_value or 15
+
+            # Get thread pool size from config, default to 40 for better parallelism
+            thread_pool_size = self.kg_bridge_config.get('kgqa_thread_pool_size', 40)
             gen_config = GenerationConfig(
                 max_turns=max_turns,  # KG default fallback: 6 turns
                 max_start_length=self.config.data.get('max_start_length', 1000),  # KG default: 1000
@@ -1509,6 +1535,8 @@ class RayPPOTrainer:
                 kgqa_relation_filter_model=self.kg_bridge_config.get('relation_filter_model'),
                 kgqa_max_calls=self.kg_bridge_config.get('max_calls'),
                 kgqa_top_k=self.kg_bridge_config.get('kg_top_k'),
+                kgqa_timeout=timeout_value,
+                kgqa_thread_pool_size=thread_pool_size,
             )
             
             self.generation_manager = LLMGenerationManager(
@@ -1519,14 +1547,8 @@ class RayPPOTrainer:
             if self.kg_bridge_config.get('use_sparql_bridge', False):
                 print(f"[KG_BRIDGE] Using kgqa_agent SPARQL bridge (endpoint: {self.kg_bridge_config.get('sparql_endpoint')})")
 
-        # create async rollout manager and request scheduler
-        self.async_rollout_mode = False
-        if self.config.actor_rollout_ref.rollout.mode == "async":
-            self.async_rollout_mode = True
-            self.async_rollout_manager = AsyncLLMServerManager(
-                config=self.config.actor_rollout_ref,
-                worker_group=self.actor_rollout_wg,
-            )
+        # Note: async rollout mode is not supported when use_search_generation=True
+        # (LLMGenerationManager handles generation directly)
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -1780,12 +1802,8 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                if "multi_modal_data" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
                 if "raw_prompt" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "tools_kwargs" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
                     
                 # CRITICAL: Add sample_id and dataset_name to the pop list so they get included in gen_batch
                 # The pop() method returns a NEW DataProto with ONLY the popped keys
@@ -1880,12 +1898,7 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                     # generate a batch
                     with _timer("gen", timing_raw):
                         if not self.use_search_generation:
-                            if not self.async_rollout_mode:
-                                gen_batch_output = self.actor_rollout_wg.generate_sequences(expanded_gen_batch)
-                            else:
-                                self.async_rollout_manager.wake_up()
-                                gen_batch_output = self.async_rollout_manager.generate_sequences(expanded_gen_batch)
-                                self.async_rollout_manager.sleep()
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(expanded_gen_batch)
                         else:
                             # Use search-augmented generation with LLMGenerationManager
                             first_input_ids = expanded_gen_batch.batch['input_ids'][:, -self.generation_manager.config.max_start_length:].clone().long()
@@ -2103,15 +2116,242 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         with _timer("dump_rollout_generations", timing_raw):
-                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            # Try to get original messages for proper ChatML formatting
+                            original_messages = None
+                            if hasattr(batch, 'non_tensor_batch') and batch.non_tensor_batch and 'raw_prompt' in batch.non_tensor_batch:
+                                original_messages = batch.non_tensor_batch['raw_prompt']
+                            
+                            # Format inputs using chat template if original messages are available
+                            formatted_inputs = []
+                            if original_messages is not None:
+                                for msg_list in original_messages:
+                                    # Handle numpy array if it's from DataProto
+                                    if isinstance(msg_list, np.ndarray):
+                                        msg_list = msg_list.tolist()
+                                    # Ensure messages is a list of dicts
+                                    if isinstance(msg_list, list) and all(isinstance(m, dict) for m in msg_list):
+                                        # Use apply_chat_template to format with proper ChatML format
+                                        try:
+                                            formatted_inputs.append(
+                                                self.tokenizer.apply_chat_template(
+                                                    msg_list, 
+                                                    add_generation_prompt=True, 
+                                                    tokenize=False
+                                                )
+                                            )
+                                        except Exception as e:
+                                            # Fallback if apply_chat_template fails
+                                            print(f"Warning: Failed to apply chat template, falling back to decode: {e}")
+                                            idx = len(formatted_inputs)
+                                            formatted_inputs.append(
+                                                self.tokenizer.batch_decode(
+                                                    batch.batch["prompts"][idx:idx+1], 
+                                                    skip_special_tokens=False
+                                                )[0]
+                                            )
+                                    else:
+                                        # Fallback if format is unexpected
+                                        idx = len(formatted_inputs)
+                                        formatted_inputs.append(
+                                            self.tokenizer.batch_decode(
+                                                batch.batch["prompts"][idx:idx+1], 
+                                                skip_special_tokens=False
+                                            )[0]
+                                        )
+                            else:
+                                # Fallback: decode token IDs directly, but remove padding tokens
+                                # batch.batch["prompts"] is left-padded, so we need to use attention_mask
+                                # to remove padding tokens before decoding
+                                prompts_tensor = batch.batch["prompts"]
+                                if "attention_mask" in batch.batch and batch.batch["attention_mask"] is not None:
+                                    # Get attention mask for prompts (first part of attention_mask)
+                                    # Note: attention_mask shape is (batch_size, prompt_length + response_length)
+                                    # We need only the prompt part
+                                    prompt_lengths = prompts_tensor.shape[1]
+                                    attention_mask_full = batch.batch["attention_mask"]
+                                    
+                                    # Extract prompt part from attention_mask
+                                    # attention_mask is (batch_size, prompt_length + response_length)
+                                    # prompts is (batch_size, prompt_length)
+                                    # So we take the first prompt_length columns
+                                    if attention_mask_full.shape[1] >= prompt_lengths:
+                                        attention_mask_prompts = attention_mask_full[:, :prompt_lengths]
+                                    else:
+                                        # If attention_mask is shorter, pad it (shouldn't happen normally)
+                                        attention_mask_prompts = attention_mask_full
+                                    
+                                    # Decode each prompt individually, removing padding tokens
+                                    formatted_inputs = []
+                                    for i in range(prompts_tensor.shape[0]):
+                                        # Get non-padding tokens for this sample
+                                        # Convert to CPU and boolean mask
+                                        if attention_mask_prompts.shape[1] == prompt_lengths:
+                                            mask = attention_mask_prompts[i].bool().cpu()
+                                        else:
+                                            # Fallback: use all tokens if shape mismatch
+                                            mask = torch.ones(prompt_lengths, dtype=torch.bool, device='cpu')
+                                        
+                                        # Extract non-padding token IDs
+                                        prompt_ids_tensor = prompts_tensor[i].cpu()
+                                        if len(mask) == len(prompt_ids_tensor):
+                                            prompt_ids = prompt_ids_tensor[mask].tolist()
+                                        else:
+                                            # Fallback: use all tokens if shape mismatch
+                                            prompt_ids = prompt_ids_tensor.tolist()
+                                        
+                                        # Decode without special tokens to avoid duplicates
+                                        decoded = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                                        formatted_inputs.append(decoded)
+                                else:
+                                    # If no attention_mask, decode directly (shouldn't happen normally)
+                                    formatted_inputs = self.tokenizer.batch_decode(
+                                        batch.batch["prompts"], 
+                                        skip_special_tokens=False
+                                    )
+                            
+                            inputs = [inp.strip() for inp in formatted_inputs]
+                            
+                            # Extract interaction_history from batch.meta_info first (needed for output construction)
+                            interaction_history = None
+                            if hasattr(batch, 'meta_info') and batch.meta_info:
+                                interaction_history = batch.meta_info.get('interaction_history', None)
+                                if interaction_history is not None:
+                                    # Ensure interaction_history length matches batch size
+                                    n_samples = len(inputs)
+                                    if len(interaction_history) != n_samples:
+                                        print(f"Warning: interaction_history length ({len(interaction_history)}) != batch size ({n_samples}), skipping interaction_history for output")
+                                        interaction_history = None
+                            
+                            # Build conversation_turns: user (initial prompt) -> assistant -> user (KG result) -> assistant -> ...
+                            conversation_turns_list = []
+                            
+                            def remove_think_tag(text):
+                                """Remove trailing <think> tags from text."""
+                                text = text.strip()
+                                for tag in ["<think>", "</think>"]:
+                                    if text.endswith(tag):
+                                        text = text[:-len(tag)].strip()
+                                return text
+                            
+                            if interaction_history and len(interaction_history) == len(inputs):
+                                for input_prompt, hist in zip(inputs, interaction_history):
+                                    turns = []
+                                    if input_prompt.strip():
+                                        turns.append({"user": remove_think_tag(input_prompt)})
+                                    
+                                    responses = hist.get("responses_str", [])
+                                    search_results = hist.get("search_results", [])
+                                    for i, resp in enumerate(responses):
+                                        if resp.strip():
+                                            turns.append({"assistant": resp.strip()})
+                                            if i < len(search_results) and search_results[i].strip():
+                                                turns.append({"user": remove_think_tag(search_results[i])})
+                                    conversation_turns_list.append(turns)
+                            else:
+                                for input_prompt in inputs:
+                                    turns = [{"user": remove_think_tag(input_prompt)}] if input_prompt.strip() else []
+                                    conversation_turns_list.append(turns)
+                            
+                            outputs = []
+                            
+                            # Try to get scores from various sources
+                            scores = None
+                            if "token_level_scores" in batch.batch:
+                                # Legacy format: use token_level_scores
+                                scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            elif "returns" in batch.batch:
+                                # Use returns (total return per sample) as scores
+                                # For multi-turn, returns might be a tensor, need to extract per-sample values
+                                returns = batch.batch["returns"]
+                                if returns.dim() > 1:
+                                    # If returns is token-level, sum over tokens
+                                    response_mask = batch.batch.get("response_mask", None)
+                                    if response_mask is not None:
+                                        # Mask returns by response_mask and sum
+                                        masked_returns = returns * response_mask
+                                        scores = masked_returns.sum(-1).cpu().tolist()
+                                    else:
+                                        # Fallback: sum over last dimension
+                                        scores = returns.sum(-1).cpu().tolist()
+                                else:
+                                    # Already per-sample
+                                    scores = returns.cpu().tolist()
+                            elif "reward" in reward_extra_infos_dict:
+                                # Use reward from reward_extra_infos_dict
+                                scores = reward_extra_infos_dict["reward"]
+                            else:
+                                # Fallback: use zeros
+                                n_samples = len(inputs)
+                                scores = [0.0] * n_samples
+                                print(f"Warning: No score source found, using zeros for {n_samples} samples")
+                            
+                            # interaction_history was already extracted above for output construction
+                            # Re-check it here for saving (it may have been set to None if length mismatch)
+                            if interaction_history is None:
+                                # Try to extract again if it wasn't extracted above
+                                if hasattr(batch, 'meta_info') and batch.meta_info:
+                                    interaction_history = batch.meta_info.get('interaction_history', None)
+                                    if interaction_history is not None:
+                                        n_samples = len(inputs)
+                                        if len(interaction_history) != n_samples:
+                                            print(f"Warning: interaction_history length ({len(interaction_history)}) != batch size ({n_samples}), skipping interaction_history")
+                                            interaction_history = None
+                            
+                            # Extract topic_entity and ground_truth from batch
+                            topic_entities_list = []
+                            ground_truth_list = []
+                            n_samples = len(inputs)
+                            
+                            if hasattr(batch, 'non_tensor_batch') and batch.non_tensor_batch:
+                                # Extract from non_tensor_batch
+                                extra_info_list = batch.non_tensor_batch.get('extra_info', None)
+                                reward_model_list = batch.non_tensor_batch.get('reward_model', None)
+                                
+                                for i in range(n_samples):
+                                    # Extract topic_entity from extra_info
+                                    topic_entity = []
+                                    if extra_info_list is not None:
+                                        if isinstance(extra_info_list, (list, np.ndarray)) and i < len(extra_info_list):
+                                            extra_info = extra_info_list[i]
+                                            if isinstance(extra_info, dict):
+                                                initial_entities = extra_info.get('initial_entities', [])
+                                                if isinstance(initial_entities, (list, np.ndarray)):
+                                                    topic_entity = [str(e) for e in initial_entities if e]
+                                                elif initial_entities:
+                                                    topic_entity = [str(initial_entities)]
+                                    topic_entities_list.append(topic_entity)
+                                    
+                                    # Extract ground_truth from reward_model
+                                    ground_truth = []
+                                    if reward_model_list is not None:
+                                        if isinstance(reward_model_list, (list, np.ndarray)) and i < len(reward_model_list):
+                                            reward_model = reward_model_list[i]
+                                            if isinstance(reward_model, dict):
+                                                gt_dict = reward_model.get('ground_truth', {})
+                                                if isinstance(gt_dict, dict):
+                                                    target_text = gt_dict.get('target_text', [])
+                                                    if isinstance(target_text, (list, np.ndarray)):
+                                                        ground_truth = [str(t) for t in target_text if t]
+                                                    elif target_text:
+                                                        ground_truth = [str(target_text)]
+                                    ground_truth_list.append(ground_truth)
+                            
+                            # If extraction failed, use empty lists
+                            if len(topic_entities_list) != n_samples:
+                                topic_entities_list = [[] for _ in range(n_samples)]
+                            if len(ground_truth_list) != n_samples:
+                                ground_truth_list = [[] for _ in range(n_samples)]
+                            
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,
                                 scores=scores,
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
+                                interaction_history=interaction_history,
+                                conversation_turns=conversation_turns_list if conversation_turns_list else None,
+                                topic_entities=topic_entities_list if topic_entities_list else None,
+                                ground_truth=ground_truth_list if ground_truth_list else None,
                             )
 
                     # validate

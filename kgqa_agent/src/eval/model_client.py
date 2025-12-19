@@ -16,7 +16,7 @@ class ModelConfig:
     temperature: float = 0.6
     max_tokens: int = 4096
     stop: Optional[List[str]] = None
-    timeout: float = 60.0  # Request timeout in seconds (default: 60s)
+    timeout: float = 15.0  # Request timeout in seconds (default: 15s)
 
 
 class BaseModelClient:

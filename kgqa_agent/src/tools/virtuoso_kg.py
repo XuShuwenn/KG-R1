@@ -27,7 +27,7 @@ class VirtuosoKG:
     Preserves behavior: timeout configuration, retry with exponential backoff,
     and a simple name cache for entity URIs.
     """
-    def __init__(self, endpoint_url: str = "http://localhost:18890/sparql", timeout_s: int = 30):
+    def __init__(self, endpoint_url: str = "http://localhost:18890/sparql", timeout_s: int = 15):
         self.endpoint_url = endpoint_url
         self.timeout_s = timeout_s
         self.sparql = None

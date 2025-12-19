@@ -111,7 +111,7 @@ class LLMClient:
     max_attempts = 6
     for attempt in range(1, max_attempts + 1):
       try:
-        resp = self._session.post(url, headers=headers, json=payload, timeout=120)
+        resp = self._session.post(url, headers=headers, json=payload, timeout=15)
         if resp.status_code >= 400:
           # Try to parse body once for helpful context
           body_text = resp.text or ""

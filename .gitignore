@@ -6,6 +6,9 @@ data_kg/
 verl.egg-info/
 outputs/
 data/
+ray_tmp/
+logs/
+rollout_trajectories/
 
 
 # Python cache files

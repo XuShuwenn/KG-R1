@@ -40,7 +40,7 @@ KG_QUERY_SERVER_INSTRUCTION = """
 6. When calling get_triples, provide a list of ALL candidate relations returned by the previous step, ranked by relevance to the question. We will automatically use the top 4. Copy each relation EXACTLY as it appears in the <information> list. Example: get_triples("Barack Obama", ["people.person.place_of_birth", "people.person.nationality", ...]).
 7. Always use double quotes around all function parameters (entity names and relations).
 
-
+·
 **ANSWER OUTPUT RULES:**
 1. Format: <answer>["Answer1", "Answer2", ...]</answer>. Return a JSON list of strings. The final answer must be a human-readable entity name, not a MID (e.g., m.01234). If the only candidate you have is a MID, do NOT output it as the final answer. Instead, explore the MID's neighbors (use `get_relations`/`get_triples`) to find a named entity to return.
 2. No external knowledge: answer ONLY using KG query results you have retrieved. The answer(s) MUST be EXACT and COMPLETE entity names from the retrieved triples. If multiple entities satisfy the question, list them all in the JSON list in <answer> tags.

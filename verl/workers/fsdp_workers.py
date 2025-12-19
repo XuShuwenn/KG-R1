@@ -100,6 +100,10 @@ class ActorRolloutRefWorker(Worker):
 
     def __init__(self, config: DictConfig, role: str):
         super().__init__()
+        # Suppress FSDP warnings about NO_SHARD and full_state_dict
+        warnings.filterwarnings("ignore", message=".*NO_SHARD.*full_state_dict.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=".*full_state_dict willbe returned.*", category=UserWarning)
+        
         self.config = config
         import torch.distributed
 

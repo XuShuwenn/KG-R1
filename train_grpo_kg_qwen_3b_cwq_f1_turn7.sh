@@ -3,14 +3,14 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 export DATA_DIR='data_kg'
 # BATCH SIZE OPTIMIZED VERSION - increase VLLM batch capacity for 20-30% speedup
 # Fix expandable segments compatibility with memory pool
-WAND_PROJECT='KG-R1-main'
+WANDB_PROJECT='KG-R1-main'
 
 # Disable VLLM usage stats to avoid permission errors
 export VLLM_USAGE_SOURCE=do-not-track
 
 rm -rf ~/.cache/torch/triton/
 
-export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
+export BASE_MODEL='/mnt/usercache/huggingface/Qwen2.5-3B-Instruct'
 export EXPERIMENT_NAME=cwq-KG-r1-grpo-qwen2.5-3b-it_f1_turn7
 export RAY_LOG_DIR=".RAY_DEBUG/${EXPERIMENT_NAME}_RAY_DEBUG"
 if [ "${RAY_DEBUG:-0}" -eq 1 ]; then
@@ -105,9 +105,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
-    trainer.test_freq=50 \
-    trainer.project_name=$WAND_PROJECT \
+    trainer.save_freq=500 \
+    trainer.test_freq=500 \
+    trainer.project_name=$WANDB_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.total_epochs=20 \
     trainer.total_training_steps=400 \

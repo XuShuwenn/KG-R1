@@ -4,6 +4,7 @@ import random
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,7 +52,7 @@ class KGQASparqlAdapter:
         self,
         sparql_endpoint: str,
         *,
-        timeout: int = 120,
+        timeout: int = 10,
         kg_top_k: int = 10,
         max_calls: int = 10,
         relation_filter_model: Optional[str] = None,
@@ -264,37 +265,56 @@ class KGQASparqlAdapter:
         question: str,
         session: _SessionState,
     ) -> Tuple[str, Dict[str, Any]]:
+        import time
+        start_time = time.time()
+        self._logger.info(f"[KG_QUERY] Starting get_relations for entity: {entity}")
+        
         entity_resolved = self._resolve_and_register_entity(entity, session)
+        resolve_time = time.time() - start_time
+        self._logger.info(f"[KG_QUERY] Entity resolution took {resolve_time:.2f}s: {entity} -> {entity_resolved}")
+        
         if not entity_resolved:
             return self._entity_error(entity, session, sample_id)
 
         try:
+            query_start = time.time()
+            self._logger.info(f"[KG_QUERY] Calling _client.get_relations for {entity_resolved}...")
             relations = self._client.get_relations(
                 entity_resolved,
                 question=question,
                 top_k=self._kg_top_k * 3,
             )
+            query_time = time.time() - query_start
+            self._logger.info(f"[KG_QUERY] get_relations completed in {query_time:.2f}s, got {len(relations) if relations else 0} relations")
         except Exception as exc:  # pragma: no cover - network errors
+            # Follow kgqa_agent pattern: log error but return simple message to model
             self._logger.warning("SPARQL get_relations failed: %s", exc)
-            return self._format_error(
-                f"SPARQL error: {exc}",
-                sample_id,
-                KGErrorType.SERVER_ERROR,
+            formatted = "No relations found."
+            payload = self._build_payload(
+                success=False,
+                content=formatted,
+                sample_id=sample_id,
+                meta={
+                    "action": "get_relations",
+                    "error_type": KGErrorType.SERVER_ERROR,
+                },
             )
+            return formatted, payload
 
         if not relations:
             formatted = "No relations found."
         else:
-            if (
-                self._relation_filter_model
-                and len(relations) > 10
-            ):
-                relations = self._filter_relations_with_llm(
-                    relations,
-                    question,
-                    entity,
-                    use_flatten_prompt=False,
-                )
+            # Align with kgqa_agent: shuffle if > 10 to avoid position bias
+            if len(relations) > 10:
+                random.shuffle(relations)
+                # Filter with LLM if filter model is configured
+                if self._relation_filter_model:
+                    relations = self._filter_relations_with_llm(
+                        relations,
+                        question,
+                        entity,
+                        use_flatten_prompt=False,
+                    )
             relations = relations[: self._kg_top_k]
             formatted = self._client.format_relations_for_prompt(relations)
             for rel in relations:
@@ -360,12 +380,19 @@ class KGQASparqlAdapter:
                 triples = result
                 cvt_info = None
         except Exception as exc:  # pragma: no cover - network errors
+            # Follow kgqa_agent pattern: log error but return simple message to model
             self._logger.warning("SPARQL get_triples failed: %s", exc)
-            return self._format_error(
-                f"SPARQL error: {exc}",
-                sample_id,
-                KGErrorType.SERVER_ERROR,
+            formatted = "No triples found."
+            payload = self._build_payload(
+                success=False,
+                content=formatted,
+                sample_id=sample_id,
+                meta={
+                    "action": "get_triples",
+                    "error_type": KGErrorType.SERVER_ERROR,
+                },
             )
+            return formatted, payload
 
         if not triples:
             formatted = "No triples found."
