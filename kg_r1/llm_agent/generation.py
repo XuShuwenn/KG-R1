@@ -128,18 +128,40 @@ class LLMGenerationManager:
         tokenizer_class = self.tokenizer.__class__.__name__
         model_name_or_path = getattr(self.tokenizer, 'name_or_path', '')
         
-        # Detect tokenizer type based on class name or model path
+        # Detect tokenizer type based on class name (primary) and model path (secondary)
+        # Priority: tokenizer_class > model_name_or_path
+        # Note: model_name_or_path may contain "LLaMA-Factory" in the path, so we check tokenizer_class first
         is_llama = False
         is_qwen = False
         
+        # Check tokenizer class first (most reliable indicator)
+        tokenizer_class_lower = tokenizer_class.lower()
+        model_path_lower = model_name_or_path.lower()
+        
         # Check for Llama tokenizers (Llama2 or Llama3)
-        if 'llama' in tokenizer_class.lower() or 'llama' in model_name_or_path.lower():
+        # Only check model path if tokenizer class doesn't clearly indicate the type
+        if 'llama' in tokenizer_class_lower:
             is_llama = True
             print(f"[TOKENIZER] Detected Llama tokenizer: {tokenizer_class} (model: {model_name_or_path})")
         # Check for Qwen tokenizers
-        elif 'qwen' in tokenizer_class.lower() or 'qwen' in model_name_or_path.lower():
+        elif 'qwen' in tokenizer_class_lower:
             is_qwen = True
             print(f"[TOKENIZER] Detected Qwen tokenizer: {tokenizer_class} (model: {model_name_or_path})")
+        # Fallback: check model path if tokenizer class doesn't match
+        # But be careful: model path may contain "LLaMA-Factory" which is not the model type
+        elif 'llama' in model_path_lower and 'qwen' not in model_path_lower:
+            # Only treat as Llama if path contains "llama" but NOT "qwen"
+            # Extract just the model name part (last component of path) to avoid false positives
+            model_name = model_path_lower.split('/')[-1] if '/' in model_path_lower else model_path_lower
+            if 'llama' in model_name:
+                is_llama = True
+                print(f"[TOKENIZER] Detected Llama tokenizer (from model path): {tokenizer_class} (model: {model_name_or_path})")
+            elif 'qwen' in model_name:
+                is_qwen = True
+                print(f"[TOKENIZER] Detected Qwen tokenizer (from model path): {tokenizer_class} (model: {model_name_or_path})")
+        elif 'qwen' in model_path_lower:
+            is_qwen = True
+            print(f"[TOKENIZER] Detected Qwen tokenizer (from model path): {tokenizer_class} (model: {model_name_or_path})")
         else:
             # Raise error for unsupported tokenizers
             raise ValueError(

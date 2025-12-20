@@ -68,7 +68,9 @@ class KGQASparqlAdapter:
         self._client = None
         self._sessions: Dict[str, _SessionState] = {}
         self._sessions_lock = threading.Lock()
-        self._relation_filter_model = relation_filter_model
+        # Ensure filter model is always configured (aligning with kgqa_agent behavior)
+        # If not provided, use default "gpt-4o-mini" like kgqa_agent
+        self._relation_filter_model = relation_filter_model or "gpt-4o-mini"
         self._relation_filter_max_tokens = relation_filter_max_tokens
         self._relation_filter_temperature = relation_filter_temperature
         self._filter_client: Optional[BaseModelClient] = None
@@ -89,21 +91,25 @@ class KGQASparqlAdapter:
         if self._client is None:
             from kgqa_agent.src.tools.direct_sparql_client import DirectSPARQLKGClient
 
+            # Filter model is always configured (defaults to "gpt-4o-mini" if not provided)
             self._client = DirectSPARQLKGClient(
                 sparql_endpoint=self._sparql_endpoint,
                 timeout=self._timeout,
-                llm_filter_callback=self._llm_filter_callback
-                if self._relation_filter_model
-                else None,
+                llm_filter_callback=self._llm_filter_callback,
             )
-            if self._relation_filter_model:
-                self._logger.info(
-                    "[KG_FILTER] Enabled relation filter model: %s",
-                    self._relation_filter_model,
-                )
+            import os
+            api_key = os.getenv("OPENAI_API_KEY", "")
+            base_url = os.getenv("OPENAI_BASE_URL", None)
+            self._logger.info(
+                "[KG_FILTER] Enabled relation filter model: %s (api_key_present=%s, base_url=%s)",
+                self._relation_filter_model,
+                bool(api_key),
+                base_url or "default OpenAI API",
+            )
 
     def _ensure_filter_client(self) -> None:
-        if not self._relation_filter_model or self._filter_client is not None:
+        # Filter model is always configured (defaults to "gpt-4o-mini" if not provided)
+        if self._filter_client is not None:
             return
         if BaseModelClient is None:
             self._logger.warning(
@@ -112,6 +118,17 @@ class KGQASparqlAdapter:
                 self._relation_filter_model,
             )
             return
+        
+        # Check environment variables
+        import os
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        base_url = os.getenv("OPENAI_BASE_URL", None)
+        
+        self._logger.info(
+            f"[KG_FILTER] Initializing filter client: model={self._relation_filter_model}, "
+            f"api_key_present={bool(api_key)}, base_url={base_url or 'default OpenAI API'}"
+        )
+        
         try:
             self._filter_client = BaseModelClient(
                 ModelConfig(
@@ -121,11 +138,15 @@ class KGQASparqlAdapter:
                     timeout=self._timeout,
                 )
             )
+            self._logger.info(
+                f"[KG_FILTER] Successfully initialized filter client for model {self._relation_filter_model}"
+            )
         except Exception as exc:  # pragma: no cover - network/SDK errors
             self._logger.warning(
                 "[KG_FILTER] Failed to initialize relation filter model %s: %s",
                 self._relation_filter_model,
                 exc,
+                exc_info=True,  # Include full traceback
             )
             self._filter_client = None
 
@@ -169,6 +190,9 @@ class KGQASparqlAdapter:
         topic_entities: Optional[Dict[str, str]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Execute a kgqa-style query and return formatted text plus raw payload."""
+        import time
+        total_start = time.time()
+        
         if not query_str:
             return self._format_error(
                 "Empty query string received. Use get_relations(entity) or get_triples(entity, [relations]).",
@@ -176,7 +200,11 @@ class KGQASparqlAdapter:
                 KGErrorType.FORMAT_ERROR,
             )
 
+        session_start = time.time()
         session = self._get_session(sample_id, topic_entities)
+        session_time = time.time() - session_start
+        if session_time > 0.01:
+            self._logger.info(f"[TIMING] run_query: session setup took {session_time:.3f}s")
         
         # Check query count limit (mimicking kgqa_agent's max_calls behavior)
         if session.query_count >= self._max_calls:
@@ -211,36 +239,63 @@ class KGQASparqlAdapter:
         # Increment query count before executing query
         session.query_count += 1
         
+        ensure_start = time.time()
         self._ensure_client()
+        ensure_time = time.time() - ensure_start
+        if ensure_time > 0.01:
+            self._logger.info(f"[TIMING] run_query: _ensure_client took {ensure_time:.3f}s")
+        
+        augment_start = time.time()
         augmented_question = self._augment_question(question, session)
+        augment_time = time.time() - augment_start
+        if augment_time > 0.01:
+            self._logger.info(f"[TIMING] run_query: _augment_question took {augment_time:.3f}s")
 
+        parse_start = time.time()
         relations_match = self._GET_RELATIONS_PATTERN.match(query_str.strip())
+        triples_match = self._GET_TRIPLES_PATTERN.match(query_str.strip())
+        parse_time = time.time() - parse_start
+        if parse_time > 0.01:
+            self._logger.info(f"[TIMING] run_query: query parsing took {parse_time:.3f}s")
+        
         if relations_match:
             entity = relations_match.group(2).strip()
-            return self._handle_get_relations(
+            result = self._handle_get_relations(
                 sample_id=sample_id,
                 entity=entity,
                 question=augmented_question,
                 session=session,
             )
+            total_time = time.time() - total_start
+            if total_time > 1.0:
+                self._logger.info(f"[TIMING] run_query: TOTAL get_relations took {total_time:.3f}s")
+            return result
 
-        triples_match = self._GET_TRIPLES_PATTERN.match(query_str.strip())
         if triples_match:
             entity = triples_match.group(2).strip()
+            parse_rel_start = time.time()
             relations = self._parse_relations(triples_match.group(3))
-            return self._handle_get_triples(
+            parse_rel_time = time.time() - parse_rel_start
+            if parse_rel_time > 0.01:
+                self._logger.info(f"[TIMING] run_query: _parse_relations took {parse_rel_time:.3f}s")
+            result = self._handle_get_triples(
                 sample_id=sample_id,
                 entity=entity,
                 relations=relations,
                 question=augmented_question,
                 session=session,
             )
+            total_time = time.time() - total_start
+            if total_time > 1.0:
+                self._logger.info(f"[TIMING] run_query: TOTAL get_triples took {total_time:.3f}s")
+            return result
 
-        return self._format_error(
-            f"[Could not parse query: {query_str}]",
-            sample_id,
-            KGErrorType.FORMAT_ERROR,
+        # Use clearer error message that's less likely to be mistaken as entity name
+        error_msg = (
+            "Invalid query format. Use get_relations(\"entity_name\") "
+            "or get_triples(\"entity_name\", [\"relation1\", ...])."
         )
+        return self._format_error(error_msg, sample_id, KGErrorType.FORMAT_ERROR)
 
     def _get_session(
         self,
@@ -266,12 +321,17 @@ class KGQASparqlAdapter:
         session: _SessionState,
     ) -> Tuple[str, Dict[str, Any]]:
         import time
-        start_time = time.time()
+        total_start = time.time()
         self._logger.info(f"[KG_QUERY] Starting get_relations for entity: {entity}")
         
+        # Augment question with initial entity names (aligning with kgqa_agent)
+        augmented_question = self._augment_question(question, session)
+        
+        resolve_start = time.time()
         entity_resolved = self._resolve_and_register_entity(entity, session)
-        resolve_time = time.time() - start_time
-        self._logger.info(f"[KG_QUERY] Entity resolution took {resolve_time:.2f}s: {entity} -> {entity_resolved}")
+        resolve_time = time.time() - resolve_start
+        if resolve_time > 0.1:
+            self._logger.info(f"[TIMING] _handle_get_relations: entity resolution took {resolve_time:.3f}s: {entity} -> {entity_resolved}")
         
         if not entity_resolved:
             return self._entity_error(entity, session, sample_id)
@@ -281,11 +341,12 @@ class KGQASparqlAdapter:
             self._logger.info(f"[KG_QUERY] Calling _client.get_relations for {entity_resolved}...")
             relations = self._client.get_relations(
                 entity_resolved,
-                question=question,
+                question=augmented_question,  # Use augmented_question (aligning with kgqa_agent)
                 top_k=self._kg_top_k * 3,
             )
             query_time = time.time() - query_start
-            self._logger.info(f"[KG_QUERY] get_relations completed in {query_time:.2f}s, got {len(relations) if relations else 0} relations")
+            if query_time > 0.1:
+                self._logger.info(f"[TIMING] _handle_get_relations: _client.get_relations took {query_time:.3f}s, got {len(relations) if relations else 0} relations")
         except Exception as exc:  # pragma: no cover - network errors
             # Follow kgqa_agent pattern: log error but return simple message to model
             self._logger.warning("SPARQL get_relations failed: %s", exc)
@@ -304,23 +365,42 @@ class KGQASparqlAdapter:
         if not relations:
             formatted = "No relations found."
         else:
-            # Align with kgqa_agent: shuffle if > 10 to avoid position bias
+            process_start = time.time()
+            # Align with kgqa_agent: only filter with LLM if len(relations) > 10
             if len(relations) > 10:
+                # Shuffle to avoid position bias before filtering
+                shuffle_start = time.time()
                 random.shuffle(relations)
-                # Filter with LLM if filter model is configured
-                if self._relation_filter_model:
-                    relations = self._filter_relations_with_llm(
-                        relations,
-                        question,
-                        entity,
-                        use_flatten_prompt=False,
-                    )
+                shuffle_time = time.time() - shuffle_start
+                if shuffle_time > 0.01:
+                    self._logger.info(f"[TIMING] _handle_get_relations: shuffle took {shuffle_time:.3f}s")
+                # Filter with LLM (filter model is always configured, aligning with kgqa_agent)
+                filter_start = time.time()
+                relations = self._filter_relations_with_llm(
+                    relations,
+                    question,
+                    entity,
+                    use_flatten_prompt=False,
+                )
+                filter_time = time.time() - filter_start
+                if filter_time > 0.1:
+                    self._logger.info(f"[TIMING] _handle_get_relations: LLM filtering took {filter_time:.3f}s")
+            truncate_start = time.time()
             relations = relations[: self._kg_top_k]
+            format_start = time.time()
             formatted = self._client.format_relations_for_prompt(relations)
+            format_time = time.time() - format_start
+            if format_time > 0.1:
+                self._logger.info(f"[TIMING] _handle_get_relations: format_relations_for_prompt took {format_time:.3f}s")
+            process_time = time.time() - process_start
+            if process_time > 0.1:
+                self._logger.info(f"[TIMING] _handle_get_relations: post-processing took {process_time:.3f}s")
+            # Update seen_relations without normalize (aligning with kgqa_agent behavior)
+            # Note: kgqa_agent uses normalize_relation in get_triples validation, but not in get_relations seen_relations update
             for rel in relations:
                 rel_name = rel.get("relation")
                 if rel_name:
-                    session.seen_relations.add(normalize_relation(rel_name))
+                    session.seen_relations.add(rel_name)  # Don't normalize, matching kgqa_agent line 150
 
         session.last_relations_text = formatted
         session.last_entities_text = ""
@@ -355,30 +435,54 @@ class KGQASparqlAdapter:
         question: str,
         session: _SessionState,
     ) -> Tuple[str, Dict[str, Any]]:
+        import time
+        total_start = time.time()
+        self._logger.info(f"[KG_QUERY] Starting get_triples for entity: {entity}, relations: {len(relations)}")
+        
+        # Augment question with initial entity names (aligning with kgqa_agent)
+        augmented_question = self._augment_question(question, session)
+        
+        resolve_start = time.time()
         entity_resolved = self._resolve_and_register_entity(entity, session)
+        resolve_time = time.time() - resolve_start
+        if resolve_time > 0.1:
+            self._logger.info(f"[TIMING] _handle_get_triples: entity resolution took {resolve_time:.3f}s: {entity} -> {entity_resolved}")
         if not entity_resolved:
             return self._entity_error(entity, session, sample_id)
 
+        validate_start = time.time()
         if session.seen_relations:
             for rel in relations:
                 norm_rel = normalize_relation(rel)
                 if norm_rel not in session.seen_relations:
                     return self._relation_choice_error(rel, session, sample_id)
+        validate_time = time.time() - validate_start
+        if validate_time > 0.01:
+            self._logger.info(f"[TIMING] _handle_get_triples: relation validation took {validate_time:.3f}s")
 
         try:
+            query_start = time.time()
+            self._logger.info(f"[KG_QUERY] Calling _client.get_triples for {entity_resolved} with {len(relations)} relations...")
             result = self._client.get_triples(
                 entity_resolved,
                 relations,
                 limit_per_relation=5,
-                question=question,
+                question=augmented_question,  # Use augmented_question (aligning with kgqa_agent)
                 return_with_cvt_info=True,
             )
+            query_time = time.time() - query_start
+            if query_time > 0.1:
+                self._logger.info(f"[TIMING] _handle_get_triples: _client.get_triples took {query_time:.3f}s")
+            parse_start = time.time()
             if isinstance(result, dict):
                 triples = result.get("triples", [])
                 cvt_info = result.get("cvt_info")
             else:
                 triples = result
                 cvt_info = None
+            parse_time = time.time() - parse_start
+            if parse_time > 0.01:
+                self._logger.info(f"[TIMING] _handle_get_triples: result parsing took {parse_time:.3f}s")
         except Exception as exc:  # pragma: no cover - network errors
             # Follow kgqa_agent pattern: log error but return simple message to model
             self._logger.warning("SPARQL get_triples failed: %s", exc)
@@ -394,6 +498,7 @@ class KGQASparqlAdapter:
             )
             return formatted, payload
 
+        format_start = time.time()
         if not triples:
             formatted = "No triples found."
         else:
@@ -401,9 +506,22 @@ class KGQASparqlAdapter:
                 f"[{triple.get('head')}, {triple.get('relation')}, {triple.get('tail')}]"
                 for triple in triples
             )
+            register_start = time.time()
             self._register_entities(triples, session)
+            register_time = time.time() - register_start
+            if register_time > 0.01:
+                self._logger.info(f"[TIMING] _handle_get_triples: _register_entities took {register_time:.3f}s")
+        format_time = time.time() - format_start
+        if format_time > 0.1:
+            self._logger.info(f"[TIMING] _handle_get_triples: formatting triples took {format_time:.3f}s")
 
+        flatten_start = time.time()
         flatten_relations = self._client.get_pending_flatten_relations(entity_resolved)
+        flatten_time = time.time() - flatten_start
+        if flatten_time > 0.1:
+            self._logger.info(f"[TIMING] _handle_get_triples: get_pending_flatten_relations took {flatten_time:.3f}s")
+        
+        cvt_start = time.time()
         formatted_cvt_info: Optional[List[Dict[str, Any]]] = None
         if cvt_info:
             formatted_cvt_info = []
@@ -429,27 +547,50 @@ class KGQASparqlAdapter:
                         "flattened_triples": flattened_triples,
                     }
                 )
+        cvt_time = time.time() - cvt_start
+        if cvt_time > 0.1:
+            self._logger.info(f"[TIMING] _handle_get_triples: CVT info formatting took {cvt_time:.3f}s")
 
         if flatten_relations:
+            rank_start = time.time()
             flatten_rel_dicts = [{"relation": rel} for rel in flatten_relations]
             other_relations = [{"relation": rel} for rel in relations[1:]]
             combined_relations = other_relations + flatten_rel_dicts
             if (
-                question
+                augmented_question
                 and combined_relations
                 and hasattr(self._client, "rank_by_similarity")
             ):
                 try:
+                    rank_sim_start = time.time()
+                    # Use augmented_question (question + initial entity names) for BM25 ranking,
+                    # aligning with kgqa_agent behavior
                     combined_relations = self._client.rank_by_similarity(
-                        combined_relations, question, "relation"
+                        combined_relations, augmented_question, "relation"
                     )
+                    rank_sim_time = time.time() - rank_sim_start
+                    if rank_sim_time > 0.1:
+                        self._logger.info(f"[TIMING] _handle_get_triples: rank_by_similarity took {rank_sim_time:.3f}s")
                 except Exception:
                     pass
             if len(combined_relations) > 10:
+                shuffle_start = time.time()
                 random.shuffle(combined_relations)
+                shuffle_time = time.time() - shuffle_start
+                if shuffle_time > 0.01:
+                    self._logger.info(f"[TIMING] _handle_get_triples: shuffle took {shuffle_time:.3f}s")
+                filter_start = time.time()
+                # Note: use_flatten_prompt=False aligns with kgqa_agent default behavior
+                # (kgqa_agent doesn't pass use_flatten_prompt parameter, so defaults to False)
                 combined_relations = self._filter_relations_with_llm(
                     combined_relations, question, entity, use_flatten_prompt=False
                 )
+                filter_time = time.time() - filter_start
+                if filter_time > 0.1:
+                    self._logger.info(f"[TIMING] _handle_get_triples: LLM filtering took {filter_time:.3f}s")
+            rank_time = time.time() - rank_start
+            if rank_time > 0.1:
+                self._logger.info(f"[TIMING] _handle_get_triples: flatten relations processing took {rank_time:.3f}s")
             for rel_dict in combined_relations:
                 rel_name = rel_dict.get("relation")
                 if rel_name:
@@ -486,6 +627,10 @@ class KGQASparqlAdapter:
                 "trace": self._get_session_trace(session),
             },
         )
+        
+        total_time = time.time() - total_start
+        if total_time > 1.0:
+            self._logger.info(f"[TIMING] _handle_get_triples: TOTAL took {total_time:.3f}s")
         return formatted, payload
 
     def _llm_filter_callback(
@@ -510,21 +655,32 @@ class KGQASparqlAdapter:
         *,
         use_flatten_prompt: bool = False,
     ) -> List[Dict[str, str]]:
-        """Filter relations via LLM to mimic kgqa_agent behaviour."""
-        if not self._relation_filter_model or not relations:
+        """Filter relations via LLM to mimic kgqa_agent behaviour.
+        
+        Note: Filter model is always configured (defaults to "gpt-4o-mini" if not provided),
+        aligning with kgqa_agent behavior.
+        """
+        import time
+        filter_start = time.time()
+        
+        if not relations:
             return relations
 
         # Keep only entries that actually contain relation names
         relation_entries = [rel for rel in relations if rel.get("relation")]
-        if len(relation_entries) <= 10 and not use_flatten_prompt:
-            return relation_entries
-
+        # Always apply LLM filter regardless of relation count (aligning with kgqa_agent behavior)
+        
+        ensure_start = time.time()
         self._ensure_filter_client()
+        ensure_time = time.time() - ensure_start
+        if ensure_time > 0.01:
+            self._logger.info(f"[TIMING] _filter_relations_with_llm: _ensure_filter_client took {ensure_time:.3f}s")
         if self._filter_client is None:
             # Failed to build client; fall back immediately
             return relation_entries
 
         # Shuffle before building prompt to avoid positional bias
+        prep_start = time.time()
         shuffled = relation_entries[:]
         random.shuffle(shuffled)
 
@@ -540,6 +696,9 @@ class KGQASparqlAdapter:
             f"Relations: {json.dumps([rel['relation'] for rel in shuffled])}\n\n"
             f"Your Selections: "
         )
+        prep_time = time.time() - prep_start
+        if prep_time > 0.01:
+            self._logger.info(f"[TIMING] _filter_relations_with_llm: prompt preparation took {prep_time:.3f}s")
 
         max_retries = 3
         last_exception: Optional[Exception] = None
@@ -548,11 +707,17 @@ class KGQASparqlAdapter:
         for attempt in range(max_retries):
             self._filter_total_calls += 1
             try:
+                llm_start = time.time()
                 response = self._filter_client.generate(
                     prompt,
                     temperature=self._relation_filter_temperature,
                     max_tokens=self._relation_filter_max_tokens,
                 )
+                llm_time = time.time() - llm_start
+                if llm_time > 0.1:
+                    self._logger.info(f"[TIMING] _filter_relations_with_llm: LLM generate (attempt {attempt+1}) took {llm_time:.3f}s")
+                
+                parse_start = time.time()
                 json_match = json_pattern.search(response or "")
                 if not json_match:
                     self._filter_parse_fail_count += 1
@@ -569,9 +734,16 @@ class KGQASparqlAdapter:
                     for name in parsed
                     if isinstance(name, str) and name in rel_map
                 ]
+                parse_time = time.time() - parse_start
+                if parse_time > 0.01:
+                    self._logger.info(f"[TIMING] _filter_relations_with_llm: response parsing took {parse_time:.3f}s")
+                
                 if ordered_filtered:
                     self._filter_success_count += 1
                     self._maybe_log_filter_stats()
+                    total_time = time.time() - filter_start
+                    if total_time > 0.1:
+                        self._logger.info(f"[TIMING] _filter_relations_with_llm: TOTAL took {total_time:.3f}s, filtered {len(ordered_filtered)}/{len(relation_entries)} relations")
                     return ordered_filtered
 
                 # If parsed successfully but no overlap, treat as fallback
@@ -598,8 +770,7 @@ class KGQASparqlAdapter:
         if now - self._filter_last_log_time < 60:
             return
         self._filter_last_log_time = now
-        if not self._relation_filter_model:
-            return
+        # Filter model is always configured
         self._logger.info(
             "[KG_FILTER] model=%s total=%d success=%d fallback=%d parse_fail=%d",
             self._relation_filter_model,
@@ -655,20 +826,65 @@ class KGQASparqlAdapter:
         entity: str,
         session: _SessionState,
     ) -> Optional[str]:
+        import time
+        resolve_start = time.time()
+        
         if not entity:
             return None
+        
+        # Reject strings that look like error messages to prevent them from being used as entity names
+        validate_start = time.time()
+        error_keywords = [
+            "Could not parse",
+            "Invalid query",
+            "Query parsing failed",
+            "Invalid entity",
+            "Error:",
+        ]
+        if any(keyword in entity for keyword in error_keywords):
+            self._logger.warning(
+                f"Rejected invalid entity name (looks like error message): {entity[:100]}"
+            )
+            return None
+        validate_time = time.time() - validate_start
+        if validate_time > 0.01:
+            self._logger.info(f"[TIMING] _resolve_and_register_entity: validation took {validate_time:.3f}s")
+        
+        check_start = time.time()
         if entity.startswith(("m.", "g.", "en.")):
             session.entity_registry[entity] = entity
             return entity
 
         key = entity.lower()
         if key in session.entity_registry:
-            return session.entity_registry[key]
+            cached = session.entity_registry[key]
+            check_time = time.time() - check_start
+            if check_time > 0.01:
+                self._logger.info(f"[TIMING] _resolve_and_register_entity: cache lookup took {check_time:.3f}s")
+            return cached
+        check_time = time.time() - check_start
+        if check_time > 0.01:
+            self._logger.info(f"[TIMING] _resolve_and_register_entity: cache check took {check_time:.3f}s")
 
+        resolve_entity_start = time.time()
         resolved = self._client._resolve_entity(entity)
+        resolve_entity_time = time.time() - resolve_entity_start
+        if resolve_entity_time > 0.1:
+            self._logger.info(f"[TIMING] _resolve_and_register_entity: _client._resolve_entity took {resolve_entity_time:.3f}s for '{entity}'")
+        
         if resolved:
+            # Validate resolved entity_id format (should be MID)
+            if not resolved.startswith(("m.", "g.", "en.")):
+                self._logger.warning(
+                    f"Resolved entity_id has invalid format: {resolved} (expected MID format)"
+                )
+                return None
             session.entity_registry[key] = resolved
             session.entity_registry[resolved] = entity
+        
+        total_time = time.time() - resolve_start
+        if total_time > 0.1:
+            self._logger.info(f"[TIMING] _resolve_and_register_entity: TOTAL took {total_time:.3f}s for '{entity}' -> {resolved}")
         return resolved
 
     @staticmethod

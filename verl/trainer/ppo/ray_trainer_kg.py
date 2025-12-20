@@ -197,32 +197,34 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
             turn_sequence_tensor = data.batch.get("turn_sequence_tensor")
             
             if turn_sequence_tensor is not None:
-                # Convert with turn-proportional strategy
+                # Use final_token_only strategy to match document specification and GAE stage
+                # This places the total reward at the last token, consistent with FormatRewardManager
                 token_level_scores = convert_structured_to_token_level(
                     structured_rewards=structured_rewards,
                     response_mask=response_mask,
                     turn_sequence_tensor=turn_sequence_tensor,
-                    distribution_strategy="turn_proportional"
+                    distribution_strategy="final_token_only"  # Fixed: use final_token_only instead of turn_proportional
                 )
-                print(f"[KL-PENALTY] Converted {len(structured_rewards)} structured rewards to token-level using turn_proportional strategy")
+                print(f"[KL-PENALTY] Converted {len(structured_rewards)} structured rewards to token-level using final_token_only strategy")
             else:
-                # Fallback: uniform distribution across valid tokens
-                print(f"[KL-PENALTY] Warning: No turn_sequence_tensor available, using uniform distribution fallback")
+                # Fallback: place reward at last valid token (matching final_token_only strategy)
+                print(f"[KL-PENALTY] Warning: No turn_sequence_tensor available, using final token placement fallback")
                 batch_size, seq_len = response_mask.shape
                 token_level_scores = torch.zeros_like(response_mask, dtype=torch.float32)
                 
                 for i, reward_dict in enumerate(structured_rewards):
-                    # Sum all reward components properly
+                    # Calculate total reward (matching the formula in kg_format_multiturn)
                     turn_reward_sum = sum(reward_dict.get("turn_rewards", {}).values())
+                    num_turns = len(reward_dict.get("turn_rewards", {}))
+                    turn_reward_mean = turn_reward_sum / num_turns if num_turns > 0 else 0.0
                     global_reward_sum = sum(v for k, v in reward_dict.get("global_rewards", {}).items() 
-                                          if not k.startswith('_raw_'))
-                    total_reward = turn_reward_sum + global_reward_sum
+                                          if not k.startswith('_'))
+                    total_reward = turn_reward_mean + global_reward_sum
                     
-                    # Distribute across all valid response tokens
+                    # Place at last valid token (matching final_token_only strategy)
                     valid_positions = (response_mask[i] == 1).nonzero(as_tuple=True)[0]
                     if len(valid_positions) > 0:
-                        reward_per_token = total_reward / len(valid_positions)
-                        token_level_scores[i, valid_positions] = reward_per_token
+                        token_level_scores[i, valid_positions[-1]] = total_reward
         else:
             # Use dummy_reward_tensor as fallback (should be zeros)
             token_level_scores = data.batch["dummy_reward_tensor"]
@@ -326,7 +328,15 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 print("[GAE-STRUCTURED] Converting structured rewards to token-level rewards for GAE (no KL penalty applied)")
                 # Convert structured rewards to token-level rewards for GAE
                 structured_rewards = data.non_tensor_batch["structured_rewards"]
-                response_mask = data.batch["response_mask"]
+                gae_response_mask = data.batch["response_mask"]
+                if (
+                    multi_turn
+                    and "loss_mask" in data.batch
+                    and data.batch["loss_mask"].size(1) >= gae_response_mask.size(1)
+                ):
+                    # Use loss_mask to exclude info tokens from GAE calculations
+                    gae_response_mask = data.batch["loss_mask"][:, -gae_response_mask.size(1):]
+
                 turn_sequence_tensor = data.batch.get("turn_sequence_tensor")
                 
                 # Use turn-aware distribution if turn information is available
@@ -341,7 +351,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                     # Note: GRPO uses different structured advantage computation and is unaffected
                     token_level_rewards = convert_structured_to_token_level(
                         structured_rewards=structured_rewards,
-                        response_mask=response_mask,
+                        response_mask=gae_response_mask,
                         turn_sequence_tensor=turn_sequence_tensor,
                         distribution_strategy="final_token_only"
                     )
@@ -351,8 +361,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                     # PPO-specific fallback: final token placement (matching FormatRewardManager)
                     # Note: GRPO framework uses different reward processing and is unaffected
                     print(f"[GAE-PPO] Warning: No turn_sequence_tensor available, using final-token placement (PPO-only fix)")
-                    batch_size, seq_len = response_mask.shape
-                    token_level_rewards = torch.zeros_like(response_mask, dtype=torch.float32)
+                    batch_size, seq_len = gae_response_mask.shape
+                    token_level_rewards = torch.zeros_like(gae_response_mask, dtype=torch.float32)
                     
                     for i, reward_dict in enumerate(structured_rewards):
                         # Normalize turn-wise rewards to avoid length bias in PPO
@@ -369,7 +379,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                         
                         # PPO: Place full reward on final valid token (FormatRewardManager style)
                         # This provides consistent reward scaling for GAE unlike distributed placement
-                        valid_positions = (response_mask[i] == 1).nonzero(as_tuple=True)[0]
+                        valid_positions = (gae_response_mask[i] == 1).nonzero(as_tuple=True)[0]
                         if len(valid_positions) > 0:
                             final_token_pos = valid_positions[-1]  # Last valid position
                             token_level_rewards[i, final_token_pos] = total_reward
@@ -383,10 +393,18 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         else:
             print("[GAE-STRUCTURED] Using existing token_level_rewards (already processed by KL penalty)")
         
+        response_mask_for_gae = data.batch["response_mask"]
+        if (
+            multi_turn
+            and "loss_mask" in data.batch
+            and data.batch["loss_mask"].size(1) >= response_mask_for_gae.size(1)
+        ):
+            response_mask_for_gae = data.batch["loss_mask"][:, -response_mask_for_gae.size(1):]
+
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
             values=data.batch["values"],
-            response_mask=data.batch["response_mask"],
+            response_mask=response_mask_for_gae,
             gamma=gamma,
             lam=lam,
         )
@@ -2265,14 +2283,35 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                                 returns = batch.batch["returns"]
                                 if returns.dim() > 1:
                                     # If returns is token-level, sum over tokens
-                                    response_mask = batch.batch.get("response_mask", None)
-                                    if response_mask is not None:
-                                        # Mask returns by response_mask and sum
-                                        masked_returns = returns * response_mask
+                                    # IMPORTANT: In multi-turn conversations with state_masking, use loss_mask
+                                    # to exclude info tokens (environment feedback) from score calculation.
+                                    # This ensures consistency with apply_kl_penalty and compute_advantage,
+                                    # which also use loss_mask to exclude info tokens.
+                                    response_length = returns.size(1)
+                                    if (self.use_search_generation and 
+                                        self.config.actor_rollout_ref.actor.get('state_masking', False) and
+                                        'loss_mask' in batch.batch):
+                                        # Use loss_mask to exclude info tokens (only count state tokens)
+                                        loss_mask = batch.batch['loss_mask']
+                                        score_mask = loss_mask[:, -response_length:] if loss_mask.size(1) > response_length else loss_mask
+                                        masked_returns = returns * score_mask
                                         scores = masked_returns.sum(-1).cpu().tolist()
                                     else:
-                                        # Fallback: sum over last dimension
-                                        scores = returns.sum(-1).cpu().tolist()
+                                        # Use response_mask (attention_mask) for single-turn or when state_masking is disabled
+                                        response_mask = batch.batch.get("response_mask", None)
+                                        if response_mask is not None:
+                                            # Ensure response_mask matches returns length
+                                            if response_mask.size(1) != response_length:
+                                                attention_mask = batch.batch.get("attention_mask", None)
+                                                if attention_mask is not None:
+                                                    response_mask = attention_mask[:, -response_length:]
+                                                else:
+                                                    response_mask = response_mask[:, -response_length:] if response_mask.size(1) > response_length else response_mask
+                                            masked_returns = returns * response_mask
+                                            scores = masked_returns.sum(-1).cpu().tolist()
+                                        else:
+                                            # Fallback: sum over last dimension
+                                            scores = returns.sum(-1).cpu().tolist()
                                 else:
                                     # Already per-sample
                                     scores = returns.cpu().tolist()

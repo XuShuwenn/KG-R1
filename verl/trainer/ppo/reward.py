@@ -135,7 +135,8 @@ def compute_reward(data: DataProto, reward_fn):
         elif "structured_rewards" in reward_result:
             # New format - structured rewards
             structured_rewards = reward_result["structured_rewards"]
-            reward_tensor = None
+            # Check if reward_tensor is also provided (from kg_format_multiturn)
+            reward_tensor = reward_result.get("reward_tensor", None)
         else:
             raise ValueError("reward_result must contain either 'reward_tensor' or 'structured_rewards'")
             
@@ -158,14 +159,24 @@ def compute_reward(data: DataProto, reward_fn):
     # Create DataProto with appropriate format
     if structured_rewards is not None:
         # Store structured rewards in non_tensor_batch for multi-turn processing
-        # Note: We still need to provide at least a dummy tensor to avoid union issues
+        # If reward_tensor is available, use it as token_level_scores (already in correct format)
         batch_size = len(structured_rewards)
         import torch
-        dummy_tensor = torch.zeros(batch_size, 1)  # Dummy tensor to maintain batch structure
-        reward_data_proto = DataProto.from_dict(
-            tensors={"dummy_reward_tensor": dummy_tensor},
-            non_tensors={"structured_rewards": structured_rewards}
-        )
+        
+        # Check if reward_tensor was provided (from kg_format_multiturn)
+        if reward_tensor is not None:
+            # Use the reward_tensor directly as token_level_scores (already placed at last token)
+            reward_data_proto = DataProto.from_dict(
+                tensors={"token_level_scores": reward_tensor},
+                non_tensors={"structured_rewards": structured_rewards}
+            )
+        else:
+            # Fallback: create dummy tensor if reward_tensor not available
+            dummy_tensor = torch.zeros(batch_size, 1)  # Dummy tensor to maintain batch structure
+            reward_data_proto = DataProto.from_dict(
+                tensors={"dummy_reward_tensor": dummy_tensor},
+                non_tensors={"structured_rewards": structured_rewards}
+            )
     else:
         # Legacy format for single-turn
         reward_data_proto = DataProto.from_dict(

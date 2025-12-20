@@ -155,6 +155,7 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             reward_extra_info = self._compute_wandb_metrics(detailed_rewards, uid_info)
             return {
                 "structured_rewards": detailed_rewards,
+                "reward_tensor": reward_tensor,  # Include reward_tensor for compatibility
                 "reward_extra_info": reward_extra_info,
             }
         else:

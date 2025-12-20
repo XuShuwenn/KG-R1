@@ -28,6 +28,6 @@ else
 fi
 
 
-new_password="12345"
-echo "root:$new_password" | chpasswd
-sleep infinity
+# new_password="12345"
+# echo "root:$new_password" | chpasswd
+# sleep infinity
