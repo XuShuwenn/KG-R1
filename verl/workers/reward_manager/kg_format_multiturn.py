@@ -48,25 +48,6 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             'exact_match': reward_kwargs.get('global_exact_match', 0.3),
             'retrieval_quality': reward_kwargs.get('global_retrieval_quality', 0.4),
         }
-
-        self.kgqa_reward_profile = reward_kwargs.get('kgqa_reward_profile', False)
-        if not self.kgqa_reward_profile:
-            data_source_hint = str(reward_kwargs.get('data_source', '')).lower()
-            if 'kgqa_agent' in data_source_hint or 'kgqa' in data_source_hint:
-                self.kgqa_reward_profile = True
-        if self.kgqa_reward_profile:
-            if 'turn_format_score' not in reward_kwargs:
-                self.turn_specific_weights['format_score'] = 0.1
-            if 'turn_kg_query_validity' not in reward_kwargs:
-                self.turn_specific_weights['kg_query_validity'] = 0.05
-            if 'turn_is_answer_score' not in reward_kwargs:
-                self.turn_specific_weights['is_answer_score'] = 0.05
-            if 'global_exact_match' not in reward_kwargs:
-                self.global_weights['exact_match'] = 0.5
-            if 'global_retrieval_quality' not in reward_kwargs:
-                self.global_weights['retrieval_quality'] = 0.3
-            if self.verbose:
-                print("[MultiTurnReward] Applying kgqa_reward_profile weight overrides")
         
         self.verbose = reward_kwargs.get('verbose', False)
         
@@ -105,10 +86,65 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         # Check if turn_sequence_tensor is available
         turn_sequence_tensor = data.batch.get('turn_sequence_tensor')
         if turn_sequence_tensor is None:
-            # Fallback to single-turn reward calculation
+            # Fallback to single-turn reward calculation, but convert to structured_rewards format
             if self.verbose:
-                print("[MultiTurnReward] No turn_sequence_tensor found, falling back to single-turn")
-            return super().__call__(data)
+                print("[MultiTurnReward] No turn_sequence_tensor found, falling back to single-turn but converting to structured_rewards format")
+            
+            # Call parent class to get reward_tensor
+            parent_result = super().__call__(data, return_dict=return_dict)
+            
+            # Convert parent result to structured_rewards format
+            if return_dict:
+                # Parent returns {"reward_tensor": ..., "reward_extra_info": ...}
+                reward_tensor = parent_result.get("reward_tensor")
+                reward_extra_info = parent_result.get("reward_extra_info", {})
+                
+                # Convert reward_tensor to structured_rewards format
+                batch_size = len(data)
+                structured_rewards = []
+                for i in range(batch_size):
+                    # Extract reward value from reward_tensor
+                    response_ids = data[i].batch["responses"]
+                    valid_response_length = data[i].batch["attention_mask"][data[i].batch["prompts"].shape[-1]:].sum()
+                    total_score = reward_tensor[i, valid_response_length - 1].item() if valid_response_length > 0 else 0.0
+                    
+                    # Create a simple structured reward dict (single-turn format)
+                    structured_rewards.append({
+                        "total_score": total_score,
+                        "turn_rewards": [],  # Empty for single-turn
+                        "global_rewards": {
+                            "exact_match": total_score,  # Use total_score as global reward
+                            "retrieval_quality": 0.0,  # No retrieval for single-turn fallback
+                        }
+                    })
+                
+                return {
+                    "structured_rewards": structured_rewards,
+                    "reward_tensor": reward_tensor,
+                    "reward_extra_info": reward_extra_info,
+                }
+            else:
+                # Parent returns reward_tensor directly
+                reward_tensor = parent_result
+                
+                # Convert to structured_rewards format
+                batch_size = len(data)
+                structured_rewards = []
+                for i in range(batch_size):
+                    response_ids = data[i].batch["responses"]
+                    valid_response_length = data[i].batch["attention_mask"][data[i].batch["prompts"].shape[-1]:].sum()
+                    total_score = reward_tensor[i, valid_response_length - 1].item() if valid_response_length > 0 else 0.0
+                    
+                    structured_rewards.append({
+                        "total_score": total_score,
+                        "turn_rewards": [],
+                        "global_rewards": {
+                            "exact_match": total_score,
+                            "retrieval_quality": 0.0,
+                        }
+                    })
+                
+                return structured_rewards
         
         batch_size = len(data)
         

@@ -128,19 +128,30 @@ def compute_reward(data: DataProto, reward_fn):
         reward_result = reward_fn(data, return_dict=True)
         
         # Handle both old format (reward_tensor) and new format (structured_rewards)
-        if "reward_tensor" in reward_result:
-            # Old format - token-level rewards
-            reward_tensor = reward_result["reward_tensor"]
-            structured_rewards = None
-        elif "structured_rewards" in reward_result:
-            # New format - structured rewards
-            structured_rewards = reward_result["structured_rewards"]
-            # Check if reward_tensor is also provided (from kg_format_multiturn)
-            reward_tensor = reward_result.get("reward_tensor", None)
-        else:
-            raise ValueError("reward_result must contain either 'reward_tensor' or 'structured_rewards'")
+        if isinstance(reward_result, dict):
+            if "reward_tensor" in reward_result and "structured_rewards" not in reward_result:
+                # Old format - token-level rewards only
+                reward_tensor = reward_result["reward_tensor"]
+                structured_rewards = None
+            elif "structured_rewards" in reward_result:
+                # New format - structured rewards (may also have reward_tensor)
+                structured_rewards = reward_result["structured_rewards"]
+                reward_tensor = reward_result.get("reward_tensor", None)
+            else:
+                raise ValueError("reward_result dict must contain either 'reward_tensor' or 'structured_rewards'")
             
-        reward_extra_infos_dict = reward_result["reward_extra_info"]
+            # Safely get reward_extra_info
+            reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
+        elif isinstance(reward_result, list):
+            # Fallback: if return_dict=True but got list, treat as structured_rewards
+            structured_rewards = reward_result
+            reward_tensor = None
+            reward_extra_infos_dict = {}
+        else:
+            # Other format (e.g., tensor)
+            reward_tensor = reward_result
+            structured_rewards = None
+            reward_extra_infos_dict = {}
     except Exception as e:
         print(f"Error in reward_fn: {e}")
         reward_result = reward_fn(data)
@@ -163,6 +174,9 @@ def compute_reward(data: DataProto, reward_fn):
         batch_size = len(structured_rewards)
         import torch
         
+        # Debug: Log what we're creating
+        print(f"[DEBUG-REWARD] Creating DataProto with structured_rewards (batch_size={batch_size}), reward_tensor={'present' if reward_tensor is not None else 'None'}")
+        
         # Check if reward_tensor was provided (from kg_format_multiturn)
         if reward_tensor is not None:
             # Use the reward_tensor directly as token_level_scores (already placed at last token)
@@ -170,18 +184,46 @@ def compute_reward(data: DataProto, reward_fn):
                 tensors={"token_level_scores": reward_tensor},
                 non_tensors={"structured_rewards": structured_rewards}
             )
+            print(f"[DEBUG-REWARD] Created DataProto with reward_tensor shape: {reward_tensor.shape}")
         else:
             # Fallback: create dummy tensor if reward_tensor not available
-            dummy_tensor = torch.zeros(batch_size, 1)  # Dummy tensor to maintain batch structure
+            # Need to match the shape of data.batch["responses"] for compatibility
+            if hasattr(data, 'batch') and "responses" in data.batch:
+                response_shape = data.batch["responses"].shape
+                dummy_tensor = torch.zeros(response_shape, dtype=torch.float32)
+                # Place reward values at the last valid token position for each sample
+                for i in range(batch_size):
+                    if i < len(data):
+                        response_ids = data[i].batch["responses"]
+                        attention_mask = data[i].batch["attention_mask"]
+                        prompt_length = data[i].batch["prompts"].shape[-1]
+                        valid_response_length = attention_mask[prompt_length:].sum()
+                        if valid_response_length > 0:
+                            reward_value = structured_rewards[i].get("total_score", 0.0) if isinstance(structured_rewards[i], dict) else 0.0
+                            dummy_tensor[i, valid_response_length - 1] = reward_value
+            else:
+                # Last resort: create minimal dummy tensor
+                dummy_tensor = torch.zeros(batch_size, 1, dtype=torch.float32)
+            
             reward_data_proto = DataProto.from_dict(
-                tensors={"dummy_reward_tensor": dummy_tensor},
+                tensors={"token_level_scores": dummy_tensor},
                 non_tensors={"structured_rewards": structured_rewards}
             )
+            print(f"[DEBUG-REWARD] Created DataProto with dummy_tensor shape: {dummy_tensor.shape}")
+        
+        # Verify structured_rewards is in the DataProto
+        if "structured_rewards" not in reward_data_proto.non_tensor_batch:
+            print(f"[ERROR-REWARD] structured_rewards NOT in reward_data_proto.non_tensor_batch after creation!")
+            print(f"[ERROR-REWARD] reward_data_proto.non_tensor_batch keys: {list(reward_data_proto.non_tensor_batch.keys())}")
+            raise ValueError("Failed to create reward_data_proto with structured_rewards")
+        else:
+            print(f"[DEBUG-REWARD] Verified: structured_rewards is in reward_data_proto.non_tensor_batch")
     else:
         # Legacy format for single-turn
         reward_data_proto = DataProto.from_dict(
             tensors={"token_level_scores": reward_tensor}
         )
+        print(f"[DEBUG-REWARD] Created DataProto in legacy format (no structured_rewards)")
     
     return reward_data_proto, reward_extra_infos_dict
 

@@ -200,11 +200,32 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     """
     # Handle both structured rewards (new format) and token_level_scores (legacy format)
     if "token_level_scores" in batch.batch:
+        # Legacy format: token_level_scores is the raw reward, token_level_rewards is after KL penalty
         sequence_score = batch.batch["token_level_scores"].sum(-1)
         sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    elif "structured_rewards" in batch.non_tensor_batch:
+        # Structured rewards format:
+        # - sequence_score: extract from structured_rewards["total_score"] (raw reward before KL penalty)
+        # - sequence_reward: extract from token_level_rewards if available (after KL penalty), 
+        #   otherwise from advantages (as fallback)
+        structured_rewards = batch.non_tensor_batch["structured_rewards"]
+        
+        # Extract total_score from structured_rewards (raw reward)
+        sequence_score = torch.tensor(
+            [reward_dict.get("total_score", 0.0) for reward_dict in structured_rewards],
+            dtype=torch.float32,
+            device=batch.batch["advantages"].device
+        )
+        
+        # Extract sequence_reward from token_level_rewards if available (after KL penalty)
+        if "token_level_rewards" in batch.batch:
+            sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+        else:
+            # Fallback: use advantages (which are computed from token_level_rewards in compute_advantage)
+            # This happens when GRPO is used without KL penalty, where token_level_rewards may not be created
+            sequence_reward = batch.batch["advantages"].sum(-1)
     else:
-        # For structured rewards format, compute sequence-level scores from advantages
-        # Use advantages as a proxy for token-level rewards for metrics
+        # Ultimate fallback: use advantages (should not happen in normal operation)
         sequence_score = batch.batch["advantages"].sum(-1)
         sequence_reward = batch.batch["advantages"].sum(-1)
     

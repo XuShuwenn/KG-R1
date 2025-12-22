@@ -400,7 +400,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             and data.batch["loss_mask"].size(1) >= response_mask_for_gae.size(1)
         ):
             response_mask_for_gae = data.batch["loss_mask"][:, -response_mask_for_gae.size(1):]
-
+        
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
             values=data.batch["values"],
@@ -1043,7 +1043,7 @@ class RayPPOTrainer:
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
-        
+
         if interaction_history is not None and len(interaction_history) == n:
             base_data["interaction_history"] = interaction_history
         
@@ -1120,7 +1120,16 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
+        import sys
+        val_batch_count = 0
+        total_val_batches = len(self.val_dataloader) if hasattr(self.val_dataloader, '__len__') else None
+        if total_val_batches:
+            print(f"[VALIDATION] Processing {total_val_batches} validation batches...", file=sys.stdout, flush=True)
+
         for test_data in self.val_dataloader:
+            val_batch_count += 1
+            if total_val_batches and val_batch_count % max(1, total_val_batches // 10) == 0:
+                print(f"[VALIDATION] Processing validation batch {val_batch_count}/{total_val_batches}...", file=sys.stdout, flush=True)
             # Extract meta_info for KG queries
             meta_info = {}
             if "sample_id" in test_data:
@@ -1238,7 +1247,7 @@ class RayPPOTrainer:
                 test_gen_batch_padded.meta_info["dataset_names"] = dataset_names
             
             if not self.use_search_generation:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
                 # Use search-augmented generation for validation - direct integration approach
                 first_input_ids = test_gen_batch_padded.batch['input_ids'][:, -self.generation_manager.config.max_start_length:].clone().long()
@@ -1325,6 +1334,9 @@ class RayPPOTrainer:
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+
+        import sys
+        print(f"[VALIDATION] Completed processing {val_batch_count} validation batches. Total samples: {len(sample_scores)}", file=sys.stdout, flush=True)
 
         data_sources = np.concatenate(data_source_lst, axis=0)
 
@@ -1783,7 +1795,18 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                 return
 
         # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        # Use file=sys.stderr to ensure progress bar is visible even when stdout is redirected
+        # Set mininterval to update at least every 1 second to show progress during long operations
+        import sys
+        progress_bar = tqdm(
+            total=self.total_training_steps, 
+            initial=self.global_steps, 
+            desc="Training Progress",
+            file=sys.stderr,
+            mininterval=1.0,  # Update at least every 1 second
+            maxinterval=10.0,  # Force update every 10 seconds even if no progress
+            dynamic_ncols=True,  # Adjust width to terminal
+        )
 
         # we start from step 1
         self.global_steps += 1
@@ -1916,7 +1939,7 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                     # generate a batch
                     with _timer("gen", timing_raw):
                         if not self.use_search_generation:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(expanded_gen_batch)
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(expanded_gen_batch)
                         else:
                             # Use search-augmented generation with LLMGenerationManager
                             first_input_ids = expanded_gen_batch.batch['input_ids'][:, -self.generation_manager.config.max_start_length:].clone().long()
@@ -1981,7 +2004,25 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                             future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                         else:
                             reward_data_proto, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            # Debug: Check if reward_data_proto has structured_rewards before union
+                            if "structured_rewards" in reward_data_proto.non_tensor_batch:
+                                print(f"[DEBUG-REWARD] reward_data_proto has structured_rewards: {len(reward_data_proto.non_tensor_batch['structured_rewards'])} items")
+                            else:
+                                print(f"[ERROR-REWARD] reward_data_proto does NOT have structured_rewards!")
+                                print(f"[DEBUG-REWARD] reward_data_proto.non_tensor_batch keys: {list(reward_data_proto.non_tensor_batch.keys())}")
+                                raise ValueError("reward_data_proto must contain structured_rewards for multi-turn advantage calculation")
+                            
+                            # Check if batch already has structured_rewards (should not happen, but handle gracefully)
+                            if "structured_rewards" in batch.non_tensor_batch:
+                                print(f"[WARNING] batch already has structured_rewards before union, this may cause issues")
+                            
                             batch = batch.union(reward_data_proto)
+                            
+                            # Verify structured_rewards is present after union
+                            if "structured_rewards" not in batch.non_tensor_batch:
+                                print(f"[ERROR] structured_rewards not found in batch.non_tensor_batch after union")
+                                print(f"[DEBUG] batch.non_tensor_batch keys: {list(batch.non_tensor_batch.keys())}")
+                                raise ValueError("structured_rewards not found in batch after union. This indicates a problem with union operation.")
 
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
@@ -2063,6 +2104,16 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                        
+                        # Debug: Verify structured_rewards is present after union
+                        if "structured_rewards" not in batch.non_tensor_batch:
+                            print(f"[ERROR] structured_rewards not found in batch.non_tensor_batch after union")
+                            print(f"[DEBUG] batch.non_tensor_batch keys: {list(batch.non_tensor_batch.keys())}")
+                            print(f"[DEBUG] batch.batch keys: {list(batch.batch.keys())}")
+                            # Check if reward_data_proto had structured_rewards
+                            if not self.config.reward_model.launch_reward_fn_async:
+                                print(f"[DEBUG] reward_data_proto.non_tensor_batch keys: {list(reward_data_proto.non_tensor_batch.keys()) if hasattr(reward_data_proto, 'non_tensor_batch') else 'N/A'}")
+                            raise ValueError("structured_rewards not found in batch after union. This indicates a problem with reward computation or union operation.")
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -2243,6 +2294,11 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                             # Build conversation_turns: user (initial prompt) -> assistant -> user (KG result) -> assistant -> ...
                             conversation_turns_list = []
                             
+                            # Get raw prompts from non_tensor_batch
+                            raw_prompts = None
+                            if hasattr(batch, 'non_tensor_batch') and 'raw_prompt' in batch.non_tensor_batch:
+                                raw_prompts = batch.non_tensor_batch['raw_prompt']
+
                             def remove_think_tag(text):
                                 """Remove trailing <think> tags from text."""
                                 text = text.strip()
@@ -2250,12 +2306,25 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                                     if text.endswith(tag):
                                         text = text[:-len(tag)].strip()
                                 return text
-                            
+
                             if interaction_history and len(interaction_history) == len(inputs):
-                                for input_prompt, hist in zip(inputs, interaction_history):
+                                for idx, (input_prompt, hist) in enumerate(zip(inputs, interaction_history)):
                                     turns = []
-                                    if input_prompt.strip():
-                                        turns.append({"user": remove_think_tag(input_prompt)})
+                                    
+                                    # Use raw prompt content if available, otherwise use formatted input
+                                    user_content = input_prompt
+                                    if raw_prompts is not None and idx < len(raw_prompts):
+                                        raw_p = raw_prompts[idx]
+                                        if isinstance(raw_p, list):
+                                            for msg in reversed(raw_p):
+                                                if msg.get('role') == 'user':
+                                                    user_content = msg.get('content')
+                                                    break
+                                        elif isinstance(raw_p, str):
+                                            user_content = raw_p
+                                    
+                                    if user_content and user_content.strip():
+                                        turns.append({"user": remove_think_tag(user_content)})
                                     
                                     responses = hist.get("responses_str", [])
                                     search_results = hist.get("search_results", [])
@@ -2266,11 +2335,37 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                                                 turns.append({"user": remove_think_tag(search_results[i])})
                                     conversation_turns_list.append(turns)
                             else:
-                                for input_prompt in inputs:
-                                    turns = [{"user": remove_think_tag(input_prompt)}] if input_prompt.strip() else []
+                                for idx, input_prompt in enumerate(inputs):
+                                    user_content = input_prompt
+                                    if raw_prompts is not None and idx < len(raw_prompts):
+                                        raw_p = raw_prompts[idx]
+                                        if isinstance(raw_p, list):
+                                            for msg in reversed(raw_p):
+                                                if msg.get('role') == 'user':
+                                                    user_content = msg.get('content')
+                                                    break
+                                        elif isinstance(raw_p, str):
+                                            user_content = raw_p
+                                            
+                                    turns = [{"user": remove_think_tag(user_content)}] if user_content and user_content.strip() else []
                                     conversation_turns_list.append(turns)
                             
+                            # Decode outputs from batch.batch["responses"]
                             outputs = []
+                            if "responses" in batch.batch:
+                                response_ids = batch.batch["responses"]
+                                # Convert to long integers if they're floats (can happen with search generation)
+                                if response_ids.dtype != torch.long:
+                                    response_ids = response_ids.long()
+                                # Decode each response individually
+                                for i in range(response_ids.shape[0]):
+                                    response_text = self.tokenizer.decode(response_ids[i], skip_special_tokens=True)
+                                    outputs.append(response_text)
+                            else:
+                                # Fallback: use empty strings if responses not available
+                                n_samples = len(inputs)
+                                outputs = [""] * n_samples
+                                print(f"Warning: 'responses' not found in batch.batch, using empty outputs for {n_samples} samples")
                             
                             # Try to get scores from various sources
                             scores = None
@@ -2395,10 +2490,13 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
+                        import sys
+                        print(f"[VALIDATION] Starting validation at step {self.global_steps}...", file=sys.stdout, flush=True)
                         with _timer("testing", timing_raw):
                             val_metrics: dict = self._validate()
                             if is_last_step:
                                 last_val_metrics = val_metrics
+                        print(f"[VALIDATION] Validation completed at step {self.global_steps}. Metrics: {list(val_metrics.keys())[:5]}...", file=sys.stdout, flush=True)
                         metrics.update(val_metrics)
 
                     if self.config.trainer.save_freq > 0 and (is_last_step or (self.global_steps > 1 and self.global_steps % self.config.trainer.save_freq == 0)):
@@ -2425,9 +2523,28 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                     metrics.update(rollout_metrics)
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                try:
+                    logger.log(data=metrics, step=self.global_steps)
+                    # Log to both stdout and stderr to ensure visibility
+                    if self.global_steps % 10 == 0:
+                        import sys
+                        print(f"[WANDB] Logged metrics at step {self.global_steps} (metrics keys: {list(metrics.keys())[:5]}...)", file=sys.stdout, flush=True)
+                except Exception as e:
+                    import sys
+                    print(f"[ERROR] Failed to log metrics to WandB at step {self.global_steps}: {e}", file=sys.stderr, flush=True)
 
+                # Update progress bar with explicit refresh to ensure visibility
                 progress_bar.update(1)
+                progress_bar.refresh()  # Force immediate refresh, especially important when output is redirected
+                
+                # Log progress update for debugging (only every 5 steps to avoid spam)
+                # Log to both stdout and stderr to ensure visibility in output.log
+                if self.global_steps % 5 == 0:
+                    import sys
+                    progress_msg = f"[TRAINING] Step {self.global_steps}/{self.total_training_steps} completed"
+                    print(progress_msg, file=sys.stdout, flush=True)  # Also log to stdout for output.log
+                    print(progress_msg, file=sys.stderr, flush=True)  # Also log to stderr for terminal
+                
                 self.global_steps += 1
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")

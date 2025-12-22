@@ -366,25 +366,26 @@ class KGQASparqlAdapter:
             formatted = "No relations found."
         else:
             process_start = time.time()
-            # Align with kgqa_agent: only filter with LLM if len(relations) > 10
-            if len(relations) > 10:
-                # Shuffle to avoid position bias before filtering
-                shuffle_start = time.time()
-                random.shuffle(relations)
-                shuffle_time = time.time() - shuffle_start
-                if shuffle_time > 0.01:
-                    self._logger.info(f"[TIMING] _handle_get_relations: shuffle took {shuffle_time:.3f}s")
-                # Filter with LLM (filter model is always configured, aligning with kgqa_agent)
-                filter_start = time.time()
-                relations = self._filter_relations_with_llm(
-                    relations,
-                    question,
-                    entity,
-                    use_flatten_prompt=False,
-                )
-                filter_time = time.time() - filter_start
-                if filter_time > 0.1:
-                    self._logger.info(f"[TIMING] _handle_get_relations: LLM filtering took {filter_time:.3f}s")
+            # Always apply LLM filter regardless of relation count (to ensure filter model is used)
+            # Shuffle to avoid position bias before filtering
+            shuffle_start = time.time()
+            random.shuffle(relations)
+            shuffle_time = time.time() - shuffle_start
+            if shuffle_time > 0.01:
+                self._logger.info(f"[TIMING] _handle_get_relations: shuffle took {shuffle_time:.3f}s")
+            # Filter with LLM (filter model is always configured)
+            filter_start = time.time()
+            self._logger.info(f"[KG_FILTER] Applying LLM filter to {len(relations)} relations (entity: {entity})")
+            relations = self._filter_relations_with_llm(
+                relations,
+                question,
+                entity,
+                use_flatten_prompt=False,
+            )
+            filter_time = time.time() - filter_start
+            if filter_time > 0.1:
+                self._logger.info(f"[TIMING] _handle_get_relations: LLM filtering took {filter_time:.3f}s")
+            self._logger.info(f"[KG_FILTER] After filtering: {len(relations)} relations remaining")
             truncate_start = time.time()
             relations = relations[: self._kg_top_k]
             format_start = time.time()
@@ -573,6 +574,7 @@ class KGQASparqlAdapter:
                         self._logger.info(f"[TIMING] _handle_get_triples: rank_by_similarity took {rank_sim_time:.3f}s")
                 except Exception:
                     pass
+            # Align with kgqa_agent: only filter with LLM if len(combined_relations) > 10
             if len(combined_relations) > 10:
                 shuffle_start = time.time()
                 random.shuffle(combined_relations)
@@ -580,6 +582,7 @@ class KGQASparqlAdapter:
                 if shuffle_time > 0.01:
                     self._logger.info(f"[TIMING] _handle_get_triples: shuffle took {shuffle_time:.3f}s")
                 filter_start = time.time()
+                self._logger.info(f"[KG_FILTER] Applying LLM filter to {len(combined_relations)} combined relations (entity: {entity})")
                 # Note: use_flatten_prompt=False aligns with kgqa_agent default behavior
                 # (kgqa_agent doesn't pass use_flatten_prompt parameter, so defaults to False)
                 combined_relations = self._filter_relations_with_llm(
@@ -588,6 +591,7 @@ class KGQASparqlAdapter:
                 filter_time = time.time() - filter_start
                 if filter_time > 0.1:
                     self._logger.info(f"[TIMING] _handle_get_triples: LLM filtering took {filter_time:.3f}s")
+                self._logger.info(f"[KG_FILTER] After filtering: {len(combined_relations)} combined relations remaining")
             rank_time = time.time() - rank_start
             if rank_time > 0.1:
                 self._logger.info(f"[TIMING] _handle_get_triples: flatten relations processing took {rank_time:.3f}s")
@@ -663,11 +667,24 @@ class KGQASparqlAdapter:
         import time
         filter_start = time.time()
         
+        # Log filter start with detailed information
+        self._logger.info(
+            f"[KG_FILTER] Starting filter: entity='{entity_name}', "
+            f"input_relations={len(relations)}, use_flatten_prompt={use_flatten_prompt}"
+        )
+        
         if not relations:
+            self._logger.info("[KG_FILTER] No relations to filter, returning empty list")
             return relations
 
         # Keep only entries that actually contain relation names
         relation_entries = [rel for rel in relations if rel.get("relation")]
+        if len(relation_entries) < len(relations):
+            self._logger.warning(
+                f"[KG_FILTER] Filtered out {len(relations) - len(relation_entries)} relations "
+                f"without 'relation' field (input={len(relations)}, valid={len(relation_entries)})"
+            )
+        
         # Always apply LLM filter regardless of relation count (aligning with kgqa_agent behavior)
         
         ensure_start = time.time()
@@ -677,12 +694,25 @@ class KGQASparqlAdapter:
             self._logger.info(f"[TIMING] _filter_relations_with_llm: _ensure_filter_client took {ensure_time:.3f}s")
         if self._filter_client is None:
             # Failed to build client; fall back immediately
+            self._logger.warning(
+                f"[KG_FILTER] Filter client not available, returning {len(relation_entries)} relations without filtering"
+            )
             return relation_entries
 
         # Shuffle before building prompt to avoid positional bias
         prep_start = time.time()
         shuffled = relation_entries[:]
         random.shuffle(shuffled)
+        
+        # Log relation names being filtered (truncate if too long)
+        relation_names = [rel['relation'] for rel in shuffled]
+        if len(relation_names) <= 20:
+            self._logger.info(f"[KG_FILTER] Filtering {len(relation_names)} relations: {relation_names}")
+        else:
+            self._logger.info(
+                f"[KG_FILTER] Filtering {len(relation_names)} relations: "
+                f"{relation_names[:10]} ... {relation_names[-10:]}"
+            )
 
         prompt_template = (
             flatten_rel_filter_prompt_template
@@ -699,6 +729,12 @@ class KGQASparqlAdapter:
         prep_time = time.time() - prep_start
         if prep_time > 0.01:
             self._logger.info(f"[TIMING] _filter_relations_with_llm: prompt preparation took {prep_time:.3f}s")
+        
+        # Log prompt info
+        self._logger.info(
+            f"[KG_FILTER] Prompt prepared: length={len(prompt)}, "
+            f"template_type={'flatten' if use_flatten_prompt else 'standard'}"
+        )
 
         max_retries = 3
         last_exception: Optional[Exception] = None
@@ -706,6 +742,10 @@ class KGQASparqlAdapter:
 
         for attempt in range(max_retries):
             self._filter_total_calls += 1
+            self._logger.info(
+                f"[KG_FILTER] LLM call attempt {attempt + 1}/{max_retries} "
+                f"(total_calls={self._filter_total_calls})"
+            )
             try:
                 llm_start = time.time()
                 response = self._filter_client.generate(
@@ -714,6 +754,15 @@ class KGQASparqlAdapter:
                     max_tokens=self._relation_filter_max_tokens,
                 )
                 llm_time = time.time() - llm_start
+                
+                # Log LLM response info
+                response_preview = (response or "")[:200] if response else "None"
+                self._logger.info(
+                    f"[KG_FILTER] LLM response received (attempt {attempt+1}): "
+                    f"time={llm_time:.3f}s, length={len(response) if response else 0}, "
+                    f"preview='{response_preview}...'"
+                )
+                
                 if llm_time > 0.1:
                     self._logger.info(f"[TIMING] _filter_relations_with_llm: LLM generate (attempt {attempt+1}) took {llm_time:.3f}s")
                 
@@ -721,11 +770,19 @@ class KGQASparqlAdapter:
                 json_match = json_pattern.search(response or "")
                 if not json_match:
                     self._filter_parse_fail_count += 1
+                    self._logger.warning(
+                        f"[KG_FILTER] Failed to find JSON array in response (attempt {attempt+1}): "
+                        f"response_preview='{response_preview}...'"
+                    )
                     break
 
                 parsed = json.loads(json_match.group(0))
                 if not isinstance(parsed, list):
                     self._filter_parse_fail_count += 1
+                    self._logger.warning(
+                        f"[KG_FILTER] Parsed JSON is not a list (attempt {attempt+1}): "
+                        f"type={type(parsed)}, value={parsed}"
+                    )
                     break
 
                 rel_map = {rel["relation"]: rel for rel in relation_entries}
@@ -734,6 +791,16 @@ class KGQASparqlAdapter:
                     for name in parsed
                     if isinstance(name, str) and name in rel_map
                 ]
+                
+                # Log filtering results
+                filtered_out = len(relation_entries) - len(ordered_filtered)
+                parsed_but_not_found = [name for name in parsed if not (isinstance(name, str) and name in rel_map)]
+                if parsed_but_not_found:
+                    self._logger.warning(
+                        f"[KG_FILTER] LLM selected relations not in input (attempt {attempt+1}): "
+                        f"{parsed_but_not_found}"
+                    )
+                
                 parse_time = time.time() - parse_start
                 if parse_time > 0.01:
                     self._logger.info(f"[TIMING] _filter_relations_with_llm: response parsing took {parse_time:.3f}s")
@@ -742,26 +809,55 @@ class KGQASparqlAdapter:
                     self._filter_success_count += 1
                     self._maybe_log_filter_stats()
                     total_time = time.time() - filter_start
+                    
+                    # Log successful filter result
+                    filtered_relation_names = [rel['relation'] for rel in ordered_filtered]
+                    if len(filtered_relation_names) <= 20:
+                        self._logger.info(
+                            f"[KG_FILTER] Filter SUCCESS (attempt {attempt+1}): "
+                            f"kept {len(ordered_filtered)}/{len(relation_entries)} relations: {filtered_relation_names}"
+                        )
+                    else:
+                        self._logger.info(
+                            f"[KG_FILTER] Filter SUCCESS (attempt {attempt+1}): "
+                            f"kept {len(ordered_filtered)}/{len(relation_entries)} relations: "
+                            f"{filtered_relation_names[:10]} ... {filtered_relation_names[-10:]}"
+                        )
+                    
                     if total_time > 0.1:
                         self._logger.info(f"[TIMING] _filter_relations_with_llm: TOTAL took {total_time:.3f}s, filtered {len(ordered_filtered)}/{len(relation_entries)} relations")
                     return ordered_filtered
 
                 # If parsed successfully but no overlap, treat as fallback
                 self._filter_fallback_count += 1
+                self._logger.warning(
+                    f"[KG_FILTER] LLM returned valid JSON but no overlap with input relations "
+                    f"(attempt {attempt+1}): parsed={parsed}, input_count={len(relation_entries)}"
+                )
                 break
             except Exception as exc:  # pragma: no cover - network/LLM errors
                 last_exception = exc
                 if attempt + 1 < max_retries:
-                    time.sleep(min(4.0, 1.5 ** attempt))
+                    retry_delay = min(4.0, 1.5 ** attempt)
+                    self._logger.warning(
+                        f"[KG_FILTER] LLM call failed (attempt {attempt+1}/{max_retries}): {exc}, "
+                        f"retrying in {retry_delay:.2f}s"
+                    )
+                    time.sleep(retry_delay)
                     continue
                 self._filter_fallback_count += 1
-                self._logger.debug(
-                    "[KG_FILTER] LLM filter failed after %d attempts: %s",
-                    attempt + 1,
-                    exc,
+                self._logger.error(
+                    f"[KG_FILTER] LLM filter failed after {attempt + 1} attempts: {exc}",
+                    exc_info=True
                 )
 
         self._maybe_log_filter_stats()
+        
+        # Log fallback result
+        self._logger.warning(
+            f"[KG_FILTER] Filter FALLBACK: returning all {len(relation_entries)} input relations "
+            f"(entity='{entity_name}')"
+        )
         return relation_entries
 
     def _maybe_log_filter_stats(self) -> None:
