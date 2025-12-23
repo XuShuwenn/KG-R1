@@ -25,7 +25,7 @@ except ImportError:
     except ImportError:
         # Define fallback functions if both imports fail
         def build_continuation_prompt(query_results: str) -> str:
-            return f'<information>Here are the query results:\n{query_results}\n</information>\n\nReview the results. If the answer is found, provide it in <answer> tags. Otherwise, continue reasoning in <think> tags and issue your next <kg-query>.\n\nReminder: After `get_relations`, you must rank all returned relations and call `get_triples` with the full ranked list. We will execute a query for the top 4.\n\n<think>'
+            return f'<information>Here are the query results:\n{query_results}\n</information>\n\nReview the results. If the answer is found, provide it in <answer> tags. Otherwise, continue reasoning in <think> tags and issue your next <kg-query>.\n\nReminder: After `get_relations`, you must rank all returned relations and call `get_triples` with the full ranked list. We will execute a query for the top 4.'
         FORCE_ANSWER_PROMPT = """You have reached the maximum number of queries. Based on the information gathered, provide your final answer in <answer> tags.
 Strict Format: <answer>["Answer1", "Answer2"]</answer>. The answer(s) must be concise entity names copied exactly from the KG results.
 """
@@ -1036,7 +1036,7 @@ class LLMGenerationManager:
                             continuation = build_continuation_prompt(kg_result.strip())
                             # The continuation prompt already includes <information> and guidance text
                             # Add <think> tag at the end to guide model thinking
-                            next_obs.append(f'\n\n{continuation}\n\n<think>')
+                            next_obs.append(f'\n\n{continuation}')
                             raw_server_responses.append(raw_kg_response)
                             dones.append(0)  # Continue conversation
                             # Fix: KG queries are invalid if search is disabled (final turn)
@@ -1058,10 +1058,10 @@ class LLMGenerationManager:
                     # Check if this is a length-exceeded response
                     if response_length_exceeded[i]:
                         # Add <think> tag after information to guide model thinking
-                        next_obs.append(f'\n\n<information>Your previous response was too long ({contents[i]}). Please provide shorter responses within the token limit.</information>\n\n<think>')
+                        next_obs.append(f'\n\n<information>Your previous response was too long ({contents[i]}). Please provide shorter responses within the token limit.</information>')
                     else:
                         # Add <think> tag after information to guide model thinking
-                        next_obs.append(f'\n\n<information>Your previous action is invalid. You should put the query between <kg-query> and </kg-query> if you want to search, or put the answer between <answer> and </answer> if you want to give the final answer.</information>\n\n<think>')
+                        next_obs.append(f'\n\n<information>Your previous action is invalid. You should put the query between <kg-query> and </kg-query> if you want to search, or put the answer between <answer> and </answer> if you want to give the final answer.</information>')
                     dones.append(0)
                     valid_action.append(0)
                     is_search.append(0)

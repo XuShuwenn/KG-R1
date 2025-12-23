@@ -82,9 +82,9 @@ class DirectSPARQLKGClient:
         return filtered or relations
     
     def _is_cvt_node(self, tail_id: str, tail_name: str) -> bool:
-        """Check if a node is a CVT node (no entity name, only MID starting with m.)."""
-        # CVT nodes typically have no name or name equals ID, and ID starts with m.
-        if not tail_id.startswith('m.'):
+        """Check if a node is a CVT node (no entity name, only MID starting with m. or g.)."""
+        # CVT nodes typically have no name or name equals ID, and ID starts with m. or g.
+        if not tail_id.startswith(('m.', 'g.')):
             return False
         # If tail_name is empty or equals tail_id, it's likely a CVT node
         if not tail_name or tail_name == tail_id:

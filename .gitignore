@@ -9,7 +9,7 @@ data/
 ray_tmp/
 logs/
 rollout_trajectories/
-
+*.log
 
 # Python cache files
 __pycache__/

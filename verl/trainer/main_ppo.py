@@ -17,6 +17,11 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import hydra
 import ray
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from verl.trainer.ppo.reward import load_reward_manager
 
@@ -29,8 +34,21 @@ def main(config):
 def run_ppo(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
+        env_vars = {
+            "TOKENIZERS_PARALLELISM": "true", 
+            "NCCL_DEBUG": "WARN", 
+            "VLLM_LOGGING_LEVEL": "WARN", 
+            "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"
+        }
+        
+        # Pass OpenAI credentials to Ray workers if available
+        if os.getenv("OPENAI_API_KEY"):
+            env_vars["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+        if os.getenv("OPENAI_BASE_URL"):
+            env_vars["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL")
+            
         ray.init(
-            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"}},
+            runtime_env={"env_vars": env_vars},
             num_cpus=config.ray_init.num_cpus,
             include_dashboard=False,  # Disable dashboard to avoid MetricsHead startup errors
         )
