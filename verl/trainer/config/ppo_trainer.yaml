@@ -712,7 +712,7 @@ reward_model:
     otc_scaling: false
 
     # Maximum number of turns for OTC scaling calculation
-    max_turns: 7
+    max_turns: 10
 
   # Cloud/local sandbox fusion configuration for custom reward logic
   sandbox_fusion:

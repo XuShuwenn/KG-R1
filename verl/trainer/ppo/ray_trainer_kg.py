@@ -39,6 +39,8 @@ This helps monitor the quality of knowledge graph queries during training.
 
 import json
 import os
+import re
+import sys
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -51,7 +53,6 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
-from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -76,10 +77,177 @@ from verl.utils.metric import (
     reduce_metrics,
 )
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
-from verl.utils.torch_functional import masked_mean, pad_sequence_to_length
+from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 # Import Role enum from the original trainer to ensure compatibility
 from verl.trainer.ppo.ray_trainer import Role
+
+# Debug-only prints in this file can be very verbose. Keep them off by default.
+_DEBUG_TRAINER = os.environ.get("VERL_TRAINER_DEBUG", "0").lower() not in {"0", "false", ""}
+
+
+_CONVERT_STRUCTURED_TO_TOKEN_LEVEL_FN = None
+
+
+def _get_convert_structured_to_token_level_fn():
+    """Get convert_structured_to_token_level with a single, cached import.
+
+    This file historically imported convert_structured_to_token_level dynamically and
+    modified sys.path at call sites. We keep the same behavior but centralize it here.
+    """
+
+    global _CONVERT_STRUCTURED_TO_TOKEN_LEVEL_FN
+    if _CONVERT_STRUCTURED_TO_TOKEN_LEVEL_FN is not None:
+        return _CONVERT_STRUCTURED_TO_TOKEN_LEVEL_FN
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+    if repo_root not in sys.path:
+        sys.path.append(repo_root)
+
+    from convert_structured_rewards import convert_structured_to_token_level
+
+    _CONVERT_STRUCTURED_TO_TOKEN_LEVEL_FN = convert_structured_to_token_level
+    return _CONVERT_STRUCTURED_TO_TOKEN_LEVEL_FN
+
+
+def _structured_rewards_to_token_level_final_token_only(
+    *,
+    structured_rewards,
+    response_mask: torch.Tensor,
+    turn_sequence_tensor: Optional[torch.Tensor],
+    global_reward_exclude_prefixes: tuple[str, ...],
+):
+    """Convert structured_rewards into token-level tensor.
+
+    Behavior is a mechanical extraction of the existing logic in this file:
+    - If turn_sequence_tensor is available: delegate to convert_structured_to_token_level
+      with distribution_strategy="final_token_only".
+    - Else: place total_reward (mean turn reward + filtered global reward sum) on the
+      last valid token according to response_mask.
+
+    Note: global_reward_exclude_prefixes must match prior call-site semantics.
+    """
+
+    if turn_sequence_tensor is not None:
+        convert_fn = _get_convert_structured_to_token_level_fn()
+        return convert_fn(
+            structured_rewards=structured_rewards,
+            response_mask=response_mask,
+            turn_sequence_tensor=turn_sequence_tensor,
+            distribution_strategy="final_token_only",
+        )
+
+    token_level = torch.zeros_like(response_mask, dtype=torch.float32)
+    for i, reward_dict in enumerate(structured_rewards):
+        turn_rewards_dict = reward_dict.get("turn_rewards", {}) if isinstance(reward_dict, dict) else {}
+        if turn_rewards_dict:
+            turn_reward_mean = sum(turn_rewards_dict.values()) / len(turn_rewards_dict)
+        else:
+            turn_reward_mean = 0.0
+
+        global_rewards = reward_dict.get("global_rewards", {}) if isinstance(reward_dict, dict) else {}
+        global_reward_sum = 0.0
+        if isinstance(global_rewards, dict) and global_rewards:
+            for k, v in global_rewards.items():
+                key_str = str(k)
+                if any(key_str.startswith(p) for p in global_reward_exclude_prefixes):
+                    continue
+                global_reward_sum += v
+
+        total_reward = turn_reward_mean + global_reward_sum
+
+        valid_positions = (response_mask[i] == 1).nonzero(as_tuple=True)[0]
+        if len(valid_positions) > 0:
+            token_level[i, valid_positions[-1]] = total_reward
+
+    return token_level
+
+
+def _normalize_dataset_name_for_meta(ds) -> str:
+    """Normalize dataset name for meta_info only (preserve current behavior).
+
+    Historically, this trainer normalizes lowercase 'cwq' to 'CWQ' in meta_info.
+    """
+
+    if ds is None:
+        return ""
+    s = str(ds)
+    return "CWQ" if s == "cwq" else s
+
+
+def _tolist_maybe(x) -> list:
+    if x is None:
+        return []
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, list):
+        return x
+    return [x]
+
+
+def _build_meta_info_from_batch_dict(batch_dict: dict) -> dict:
+    """Build meta_info for KG queries from a dataloader batch dict."""
+
+    meta_info: dict = {}
+
+    if "sample_id" in batch_dict:
+        meta_info["sample_ids"] = _tolist_maybe(batch_dict["sample_id"])
+
+    if "dataset_name" in batch_dict:
+        dataset_names = _tolist_maybe(batch_dict["dataset_name"])
+        meta_info["dataset_names"] = [_normalize_dataset_name_for_meta(ds) for ds in dataset_names]
+
+    return meta_info
+
+
+def _build_generation_pop_keys(batch: DataProto, *, include_meta_info_keys: bool) -> tuple[list[str], list[str], list[str]]:
+    """Build pop keys for generation batches.
+
+    This preserves the existing behavior of including raw prompt/sample fields
+    in the gen_batch returned by DataProto.pop().
+    """
+
+    batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+    non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+    if "raw_prompt" in batch.non_tensor_batch:
+        non_tensor_batch_keys_to_pop.append("raw_prompt")
+
+    # CRITICAL: Add sample_id and dataset_name to include them in gen_batch
+    if "sample_id" in batch.non_tensor_batch:
+        non_tensor_batch_keys_to_pop.append("sample_id")
+    if "dataset_name" in batch.non_tensor_batch:
+        non_tensor_batch_keys_to_pop.append("dataset_name")
+
+    meta_info_keys_to_pop: list[str] = []
+    if include_meta_info_keys and batch.meta_info:
+        if "sample_ids" in batch.meta_info:
+            meta_info_keys_to_pop.append("sample_ids")
+        if "dataset_names" in batch.meta_info:
+            meta_info_keys_to_pop.append("dataset_names")
+
+    return batch_keys_to_pop, non_tensor_batch_keys_to_pop, meta_info_keys_to_pop
+
+
+def _infer_dataset_names_from_non_tensor_batch(non_tensor_batch: dict, *, default: str = "webqsp") -> list[str]:
+    """Infer dataset_names for KG queries (preserve existing fallback semantics)."""
+
+    dataset_names: list[str] = []
+    if "dataset_name" in non_tensor_batch:
+        dataset_names = _tolist_maybe(non_tensor_batch.get("dataset_name"))
+        return [str(x) for x in dataset_names]
+
+    if "data_source" in non_tensor_batch:
+        data_sources = non_tensor_batch.get("data_source")
+        for ds in _tolist_maybe(data_sources):
+            if ds in ["webqsp_kg", "webqsp"]:
+                dataset_names.append("webqsp")
+            elif ds in ["cwq_kg", "cwq"]:
+                dataset_names.append("CWQ")
+            else:
+                dataset_names.append(default)
+        return dataset_names
+
+    return [default]
 
 WorkerType = Type[Worker]
 
@@ -179,12 +347,6 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
         if "structured_rewards" in data.non_tensor_batch:
             print("[KL-PENALTY] Converting structured rewards to token-level scores for KL penalty calculation")
             
-            # Import our conversion function
-            import sys
-            import os
-            sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
-            from convert_structured_rewards import convert_structured_to_token_level
-            
             # Get response mask for conversion
             if multi_turn:
                 loss_mask = data.batch["loss_mask"]
@@ -199,32 +361,22 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
             if turn_sequence_tensor is not None:
                 # Use final_token_only strategy to match document specification and GAE stage
                 # This places the total reward at the last token, consistent with FormatRewardManager
-                token_level_scores = convert_structured_to_token_level(
+                token_level_scores = _structured_rewards_to_token_level_final_token_only(
                     structured_rewards=structured_rewards,
                     response_mask=response_mask,
                     turn_sequence_tensor=turn_sequence_tensor,
-                    distribution_strategy="final_token_only"  # Fixed: use final_token_only instead of turn_proportional
+                    global_reward_exclude_prefixes=("_",),
                 )
                 print(f"[KL-PENALTY] Converted {len(structured_rewards)} structured rewards to token-level using final_token_only strategy")
             else:
                 # Fallback: place reward at last valid token (matching final_token_only strategy)
                 print(f"[KL-PENALTY] Warning: No turn_sequence_tensor available, using final token placement fallback")
-                batch_size, seq_len = response_mask.shape
-                token_level_scores = torch.zeros_like(response_mask, dtype=torch.float32)
-                
-                for i, reward_dict in enumerate(structured_rewards):
-                    # Calculate total reward (matching the formula in kg_format_multiturn)
-                    turn_reward_sum = sum(reward_dict.get("turn_rewards", {}).values())
-                    num_turns = len(reward_dict.get("turn_rewards", {}))
-                    turn_reward_mean = turn_reward_sum / num_turns if num_turns > 0 else 0.0
-                    global_reward_sum = sum(v for k, v in reward_dict.get("global_rewards", {}).items() 
-                                          if not k.startswith('_'))
-                    total_reward = turn_reward_mean + global_reward_sum
-                    
-                    # Place at last valid token (matching final_token_only strategy)
-                    valid_positions = (response_mask[i] == 1).nonzero(as_tuple=True)[0]
-                    if len(valid_positions) > 0:
-                        token_level_scores[i, valid_positions[-1]] = total_reward
+                token_level_scores = _structured_rewards_to_token_level_final_token_only(
+                    structured_rewards=structured_rewards,
+                    response_mask=response_mask,
+                    turn_sequence_tensor=None,
+                    global_reward_exclude_prefixes=("_",),
+                )
         else:
             # Use dummy_reward_tensor as fallback (should be zeros)
             token_level_scores = data.batch["dummy_reward_tensor"]
@@ -341,19 +493,13 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 
                 # Use turn-aware distribution if turn information is available
                 if turn_sequence_tensor is not None:
-                    # Import our conversion function
-                    import sys
-                    import os
-                    sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
-                    from convert_structured_rewards import convert_structured_to_token_level
-                    
                     # PPO: Convert with final-token placement for consistent reward scaling
                     # Note: GRPO uses different structured advantage computation and is unaffected
-                    token_level_rewards = convert_structured_to_token_level(
+                    token_level_rewards = _structured_rewards_to_token_level_final_token_only(
                         structured_rewards=structured_rewards,
                         response_mask=gae_response_mask,
                         turn_sequence_tensor=turn_sequence_tensor,
-                        distribution_strategy="final_token_only"
+                        global_reward_exclude_prefixes=("_raw_",),
                     )
                     
                     print(f"[GAE-PPO] Converted {len(structured_rewards)} structured rewards to token-level using final_token_only strategy")
@@ -361,28 +507,12 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                     # PPO-specific fallback: final token placement (matching FormatRewardManager)
                     # Note: GRPO framework uses different reward processing and is unaffected
                     print(f"[GAE-PPO] Warning: No turn_sequence_tensor available, using final-token placement (PPO-only fix)")
-                    batch_size, seq_len = gae_response_mask.shape
-                    token_level_rewards = torch.zeros_like(gae_response_mask, dtype=torch.float32)
-                    
-                    for i, reward_dict in enumerate(structured_rewards):
-                        # Normalize turn-wise rewards to avoid length bias in PPO
-                        turn_rewards_dict = reward_dict.get("turn_rewards", {})
-                        if turn_rewards_dict:
-                            turn_reward_mean = sum(turn_rewards_dict.values()) / len(turn_rewards_dict)
-                        else:
-                            turn_reward_mean = 0.0
-                            
-                        global_reward_sum = sum(v for k, v in reward_dict.get("global_rewards", {}).items() 
-                                              if not k.startswith('_raw_'))
-                        # PPO normalization: global + mean(turn-wise) to prevent length bias
-                        total_reward = turn_reward_mean + global_reward_sum
-                        
-                        # PPO: Place full reward on final valid token (FormatRewardManager style)
-                        # This provides consistent reward scaling for GAE unlike distributed placement
-                        valid_positions = (gae_response_mask[i] == 1).nonzero(as_tuple=True)[0]
-                        if len(valid_positions) > 0:
-                            final_token_pos = valid_positions[-1]  # Last valid position
-                            token_level_rewards[i, final_token_pos] = total_reward
+                    token_level_rewards = _structured_rewards_to_token_level_final_token_only(
+                        structured_rewards=structured_rewards,
+                        response_mask=gae_response_mask,
+                        turn_sequence_tensor=None,
+                        global_reward_exclude_prefixes=("_raw_",),
+                    )
                 
                 data.batch["token_level_rewards"] = token_level_rewards
             elif "token_level_scores" in data.batch:
@@ -1034,18 +1164,87 @@ class RayPPOTrainer:
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
+        def _extract_prediction_from_text(text):
+            """Extract model prediction from <answer>...</answer>.
+
+            Returns:
+                - parsed JSON (usually list[str]) when possible
+                - raw inner string when JSON parsing fails
+                - None when no <answer> tag exists
+            """
+            if text is None:
+                return None
+            if isinstance(text, list):
+                # If multi-part output, prefer the last non-empty chunk
+                for chunk in reversed(text):
+                    if isinstance(chunk, str) and chunk.strip():
+                        text = chunk
+                        break
+                if isinstance(text, list):
+                    return None
+            if not isinstance(text, str):
+                return None
+
+            def _strip_code_fence(s: str) -> str:
+                s = s.strip()
+                if s.startswith("```"):
+                    # remove first line fence (``` or ```json)
+                    s = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", s)
+                    # remove trailing fence
+                    s = re.sub(r"\n```\s*$", "", s)
+                return s.strip()
+
+            m = re.findall(r"<answer>(.*?)</answer>", text, flags=re.DOTALL | re.IGNORECASE)
+            if m:
+                inner = _strip_code_fence(m[-1])
+                if not inner:
+                    return None
+                try:
+                    return json.loads(inner)
+                except Exception:
+                    return inner
+
+            # Fallback (conservative): try to extract the last simple JSON array literal like ["..."]
+            # Avoid dumping the full output (which may contain long reasoning).
+            array_matches = re.findall(r"\[[^\[\]]*\]", text)
+            if not array_matches:
+                return None
+            candidate = _strip_code_fence(array_matches[-1])
+            try:
+                return json.loads(candidate)
+            except Exception:
+                return None
+
+        def _sanitize_interaction_history(hist_list):
+            """Remove very large / redundant fields before dumping trajectories."""
+            if hist_list is None:
+                return None
+            if not isinstance(hist_list, list):
+                return hist_list
+            drop_keys = {"raw_server_responses", "responses_str", "reasonings"}
+            sanitized = []
+            for h in hist_list:
+                if isinstance(h, dict):
+                    sanitized.append({k: v for k, v in h.items() if k not in drop_keys})
+                else:
+                    sanitized.append(h)
+            return sanitized
+
         n = len(inputs)
         base_data = {
             "score": scores,
             "step": [self.global_steps] * n,
         }
 
+        # Save <answer>...</answer> contents as prediction
+        base_data["prediction"] = [_extract_prediction_from_text(o) for o in (outputs or [None] * n)]
+
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
 
         if interaction_history is not None and len(interaction_history) == n:
-            base_data["interaction_history"] = interaction_history
+            base_data["interaction_history"] = _sanitize_interaction_history(interaction_history)
         
         if conversation_turns is not None and len(conversation_turns) == n:
             base_data["conversation_turns"] = conversation_turns
@@ -1090,8 +1289,6 @@ class RayPPOTrainer:
         if generations_to_log == 0:
             return
 
-        import numpy as np
-
         # Create tuples of (input, output, score) and sort by input text
         samples = list(zip(inputs, outputs, scores))
         samples.sort(key=lambda x: x[0])  # Sort by input text
@@ -1120,7 +1317,6 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
-        import sys
         val_batch_count = 0
         total_val_batches = len(self.val_dataloader) if hasattr(self.val_dataloader, '__len__') else None
         if total_val_batches:
@@ -1131,21 +1327,7 @@ class RayPPOTrainer:
             if total_val_batches and val_batch_count % max(1, total_val_batches // 10) == 0:
                 print(f"[VALIDATION] Processing validation batch {val_batch_count}/{total_val_batches}...", file=sys.stdout, flush=True)
             # Extract meta_info for KG queries
-            meta_info = {}
-            if "sample_id" in test_data:
-                if isinstance(test_data["sample_id"], np.ndarray):
-                    meta_info["sample_ids"] = test_data["sample_id"].tolist()
-                else:
-                    meta_info["sample_ids"] = [test_data["sample_id"]]
-            if "dataset_name" in test_data:
-                if isinstance(test_data["dataset_name"], np.ndarray):
-                    dataset_names = test_data["dataset_name"].tolist()
-                    # Fix lowercase cwq to uppercase CWQ
-                    meta_info["dataset_names"] = ["CWQ" if ds == "cwq" else ds for ds in dataset_names]
-                else:
-                    dataset_name = test_data["dataset_name"]
-                    # Fix lowercase cwq to uppercase CWQ
-                    meta_info["dataset_names"] = ["CWQ" if dataset_name == "cwq" else dataset_name]
+            meta_info = _build_meta_info_from_batch_dict(test_data)
             
             test_batch = DataProto.from_single_dict(test_data, meta_info=meta_info)
             
@@ -1162,17 +1344,10 @@ class RayPPOTrainer:
             # Control prompt augmentation in the dataset - no trainer-side augmentation needed
             # The dataset handles augmentation based on its configuration
 
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-                
-            # CRITICAL: Add sample_id and dataset_name to the pop list so they get included in test_gen_batch
-            # The pop() method returns a NEW DataProto with ONLY the popped keys
-            if "sample_id" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("sample_id")
-            if "dataset_name" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("dataset_name")
+            batch_keys_to_pop, non_tensor_batch_keys_to_pop, _ = _build_generation_pop_keys(
+                test_batch,
+                include_meta_info_keys=False,
+            )
                 
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
@@ -1193,19 +1368,13 @@ class RayPPOTrainer:
             if "dataset_name" in test_gen_batch.non_tensor_batch:
                 # Use explicit dataset_name from extra_info
                 dataset_names = test_gen_batch.non_tensor_batch["dataset_name"].tolist()
-            elif "data_source" in test_gen_batch.non_tensor_batch:
-                # Fallback: map data_source to dataset_name
-                data_sources = test_gen_batch.non_tensor_batch["data_source"]
-                for ds in data_sources:
-                    if ds in ["webqsp_kg", "webqsp"]:
-                        dataset_names.append("webqsp")
-                    elif ds in ["cwq_kg", "cwq"]:
-                        dataset_names.append("CWQ")
-                    else:
-                        dataset_names.append("webqsp")  # fallback
             else:
-                # Use webqsp as default fallback
-                dataset_names = ["webqsp"] * len(test_gen_batch.batch)
+                dataset_names = _infer_dataset_names_from_non_tensor_batch(
+                    test_gen_batch.non_tensor_batch,
+                    default="webqsp",
+                )
+                if len(dataset_names) == 1 and len(test_gen_batch.batch) > 1:
+                    dataset_names = dataset_names * len(test_gen_batch.batch)
 
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -1222,8 +1391,9 @@ class RayPPOTrainer:
                 test_gen_batch.meta_info["sample_ids"] = sample_ids
             if dataset_names:
                 test_gen_batch.meta_info["dataset_names"] = dataset_names
-                
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+
+            if _DEBUG_TRAINER:
+                print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
@@ -1257,7 +1427,7 @@ class RayPPOTrainer:
                 )
 
             # DEBUG: Print meta_info during validation to understand truncation behavior
-            if hasattr(test_output_gen_batch_padded, 'meta_info') and test_output_gen_batch_padded.meta_info:
+            if _DEBUG_TRAINER and hasattr(test_output_gen_batch_padded, 'meta_info') and test_output_gen_batch_padded.meta_info:
                 meta_info = test_output_gen_batch_padded.meta_info
                 print(f"\n=== DEBUG VALIDATION META_INFO ===")
                 
@@ -1335,7 +1505,6 @@ class RayPPOTrainer:
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
-        import sys
         print(f"[VALIDATION] Completed processing {val_batch_count} validation batches. Total samples: {len(sample_scores)}", file=sys.stdout, flush=True)
 
         data_sources = np.concatenate(data_source_lst, axis=0)
@@ -1403,8 +1572,6 @@ class RayPPOTrainer:
         Returns:
             Dict mapping metric names to aggregated values for WandB logging
         """
-        from collections import defaultdict
-        import numpy as np
         
         # Define core metrics that should be logged to rl-core
         core_metrics = {
@@ -1797,7 +1964,6 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
         # add tqdm
         # Use file=sys.stderr to ensure progress bar is visible even when stdout is redirected
         # Set mininterval to update at least every 1 second to show progress during long operations
-        import sys
         progress_bar = tqdm(
             total=self.total_training_steps, 
             initial=self.global_steps, 
@@ -1818,21 +1984,7 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                 timing_raw = {}
                 
                 # Extract meta_info for KG queries
-                meta_info = {}
-                if "sample_id" in batch_dict:
-                    if isinstance(batch_dict["sample_id"], np.ndarray):
-                        meta_info["sample_ids"] = batch_dict["sample_id"].tolist()
-                    else:
-                        meta_info["sample_ids"] = [batch_dict["sample_id"]]
-                if "dataset_name" in batch_dict:
-                    if isinstance(batch_dict["dataset_name"], np.ndarray):
-                        dataset_names = batch_dict["dataset_name"].tolist()
-                        # Fix lowercase cwq to uppercase CWQ
-                        meta_info["dataset_names"] = ["CWQ" if ds == "cwq" else ds for ds in dataset_names]
-                    else:
-                        dataset_name = batch_dict["dataset_name"]
-                        # Fix lowercase cwq to uppercase CWQ
-                        meta_info["dataset_names"] = ["CWQ" if dataset_name == "cwq" else dataset_name]
+                meta_info = _build_meta_info_from_batch_dict(batch_dict)
                 
                 batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
 
@@ -1841,24 +1993,10 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                     self.train_dataset.set_current_step(self.global_steps)
 
                 # pop those keys for generation
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                if "raw_prompt" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
-                    
-                # CRITICAL: Add sample_id and dataset_name to the pop list so they get included in gen_batch
-                # The pop() method returns a NEW DataProto with ONLY the popped keys
-                if "sample_id" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("sample_id")
-                if "dataset_name" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("dataset_name")
-                    
-                # Pop keys needed for generation, including meta_info
-                meta_info_keys_to_pop = []
-                if "sample_ids" in batch.meta_info:
-                    meta_info_keys_to_pop.append("sample_ids")
-                if "dataset_names" in batch.meta_info:
-                    meta_info_keys_to_pop.append("dataset_names")
+                batch_keys_to_pop, non_tensor_batch_keys_to_pop, meta_info_keys_to_pop = _build_generation_pop_keys(
+                    batch,
+                    include_meta_info_keys=True,
+                )
                     
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
@@ -1916,19 +2054,14 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                         if "dataset_name" in expanded_gen_batch.non_tensor_batch:
                             # Use explicit dataset_name from extra_info
                             dataset_names = expanded_gen_batch.non_tensor_batch["dataset_name"].tolist()
-                        elif "data_source" in expanded_gen_batch.non_tensor_batch:
-                            # Fallback: map data_source to dataset_name
-                            data_sources = expanded_gen_batch.non_tensor_batch["data_source"]
-                            for ds in data_sources:
-                                if ds in ["webqsp_kg", "webqsp"]:
-                                    dataset_names.append("webqsp")
-                                elif ds in ["cwq_kg", "cwq"]:
-                                    dataset_names.append("CWQ")
-                                else:
-                                    dataset_names.append("webqsp")  # fallback
                         else:
-                            # Use webqsp as default fallback
-                            dataset_names = ["webqsp"] * len(expanded_gen_batch.batch)
+                            # Fallback: infer from data_source or default
+                            dataset_names = _infer_dataset_names_from_non_tensor_batch(
+                                expanded_gen_batch.non_tensor_batch,
+                                default="webqsp",
+                            )
+                            if len(dataset_names) == 1 and len(expanded_gen_batch.batch) > 1:
+                                dataset_names = dataset_names * len(expanded_gen_batch.batch)
                         
                         # Add per-sample information to meta_info AFTER repeat
                         if sample_ids:
@@ -2006,7 +2139,8 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                             reward_data_proto, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
                             # Debug: Check if reward_data_proto has structured_rewards before union
                             if "structured_rewards" in reward_data_proto.non_tensor_batch:
-                                print(f"[DEBUG-REWARD] reward_data_proto has structured_rewards: {len(reward_data_proto.non_tensor_batch['structured_rewards'])} items")
+                                if _DEBUG_TRAINER:
+                                    print(f"[DEBUG-REWARD] reward_data_proto has structured_rewards: {len(reward_data_proto.non_tensor_batch['structured_rewards'])} items")
                             else:
                                 print(f"[ERROR-REWARD] reward_data_proto does NOT have structured_rewards!")
                                 print(f"[DEBUG-REWARD] reward_data_proto.non_tensor_batch keys: {list(reward_data_proto.non_tensor_batch.keys())}")
@@ -2014,7 +2148,8 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                             
                             # Check if batch already has structured_rewards (should not happen, but handle gracefully)
                             if "structured_rewards" in batch.non_tensor_batch:
-                                print(f"[WARNING] batch already has structured_rewards before union, this may cause issues")
+                                if _DEBUG_TRAINER:
+                                    print(f"[WARNING] batch already has structured_rewards before union, this may cause issues")
                             
                             batch = batch.union(reward_data_proto)
                             
@@ -2291,63 +2426,58 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                                         print(f"Warning: interaction_history length ({len(interaction_history)}) != batch size ({n_samples}), skipping interaction_history for output")
                                         interaction_history = None
                             
-                            # Build conversation_turns: user (initial prompt) -> assistant -> user (KG result) -> assistant -> ...
+                            # Build conversation_turns using the pre-tokenized (untemplated) messages when available
+                            # Structure: list of {role: content} in chronological order
                             conversation_turns_list = []
-                            
-                            # Get raw prompts from non_tensor_batch
+
                             raw_prompts = None
                             if hasattr(batch, 'non_tensor_batch') and 'raw_prompt' in batch.non_tensor_batch:
                                 raw_prompts = batch.non_tensor_batch['raw_prompt']
 
-                            def remove_think_tag(text):
-                                """Remove trailing <think> tags from text."""
+                            def remove_think_tag(text: str) -> str:
                                 text = text.strip()
                                 for tag in ["<think>", "</think>"]:
                                     if text.endswith(tag):
                                         text = text[:-len(tag)].strip()
                                 return text
 
+                            def append_raw_prompt_turns(raw_prompt_obj, turns):
+                                """Append raw prompt messages (list of role/content) without chat-template tokens."""
+                                if isinstance(raw_prompt_obj, list):
+                                    for msg in raw_prompt_obj:
+                                        role = msg.get('role')
+                                        content = msg.get('content')
+                                        if role and content:
+                                            turns.append({role: remove_think_tag(content)})
+                                elif isinstance(raw_prompt_obj, str):
+                                    if raw_prompt_obj.strip():
+                                        turns.append({"user": remove_think_tag(raw_prompt_obj)})
+
                             if interaction_history and len(interaction_history) == len(inputs):
                                 for idx, (input_prompt, hist) in enumerate(zip(inputs, interaction_history)):
                                     turns = []
-                                    
-                                    # Use raw prompt content if available, otherwise use formatted input
-                                    user_content = input_prompt
+
+                                    # Prefer raw_prompt (structured, untemplated); otherwise fall back to decoded input
                                     if raw_prompts is not None and idx < len(raw_prompts):
-                                        raw_p = raw_prompts[idx]
-                                        if isinstance(raw_p, list):
-                                            for msg in reversed(raw_p):
-                                                if msg.get('role') == 'user':
-                                                    user_content = msg.get('content')
-                                                    break
-                                        elif isinstance(raw_p, str):
-                                            user_content = raw_p
-                                    
-                                    if user_content and user_content.strip():
-                                        turns.append({"user": remove_think_tag(user_content)})
-                                    
+                                        append_raw_prompt_turns(raw_prompts[idx], turns)
+                                    elif input_prompt and input_prompt.strip():
+                                        turns.append({"user": remove_think_tag(input_prompt)})
+
                                     responses = hist.get("responses_str", [])
                                     search_results = hist.get("search_results", [])
                                     for i, resp in enumerate(responses):
                                         if resp.strip():
                                             turns.append({"assistant": resp.strip()})
-                                            if i < len(search_results) and search_results[i].strip():
-                                                turns.append({"user": remove_think_tag(search_results[i])})
+                                        if i < len(search_results) and search_results[i].strip():
+                                            turns.append({"user": remove_think_tag(search_results[i])})
                                     conversation_turns_list.append(turns)
                             else:
                                 for idx, input_prompt in enumerate(inputs):
-                                    user_content = input_prompt
+                                    turns = []
                                     if raw_prompts is not None and idx < len(raw_prompts):
-                                        raw_p = raw_prompts[idx]
-                                        if isinstance(raw_p, list):
-                                            for msg in reversed(raw_p):
-                                                if msg.get('role') == 'user':
-                                                    user_content = msg.get('content')
-                                                    break
-                                        elif isinstance(raw_p, str):
-                                            user_content = raw_p
-                                            
-                                    turns = [{"user": remove_think_tag(user_content)}] if user_content and user_content.strip() else []
+                                        append_raw_prompt_turns(raw_prompts[idx], turns)
+                                    elif input_prompt and input_prompt.strip():
+                                        turns.append({"user": remove_think_tag(input_prompt)})
                                     conversation_turns_list.append(turns)
                             
                             # Decode outputs from batch.batch["responses"]
@@ -2490,7 +2620,6 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
-                        import sys
                         print(f"[VALIDATION] Starting validation at step {self.global_steps}...", file=sys.stdout, flush=True)
                         with _timer("testing", timing_raw):
                             val_metrics: dict = self._validate()
@@ -2527,10 +2656,8 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                     logger.log(data=metrics, step=self.global_steps)
                     # Log to both stdout and stderr to ensure visibility
                     if self.global_steps % 10 == 0:
-                        import sys
                         print(f"[WANDB] Logged metrics at step {self.global_steps} (metrics keys: {list(metrics.keys())[:5]}...)", file=sys.stdout, flush=True)
                 except Exception as e:
-                    import sys
                     print(f"[ERROR] Failed to log metrics to WandB at step {self.global_steps}: {e}", file=sys.stderr, flush=True)
 
                 # Update progress bar with explicit refresh to ensure visibility
@@ -2540,7 +2667,6 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                 # Log progress update for debugging (only every 5 steps to avoid spam)
                 # Log to both stdout and stderr to ensure visibility in output.log
                 if self.global_steps % 5 == 0:
-                    import sys
                     progress_msg = f"[TRAINING] Step {self.global_steps}/{self.total_training_steps} completed"
                     print(progress_msg, file=sys.stdout, flush=True)  # Also log to stdout for output.log
                     print(progress_msg, file=sys.stderr, flush=True)  # Also log to stderr for terminal

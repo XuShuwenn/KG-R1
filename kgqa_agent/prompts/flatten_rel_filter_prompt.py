@@ -19,10 +19,21 @@ You will be provided with:
 
 ## Task
 
-- Select **exactly 8** flatten relations from the candidate list that are most likely to help answer the question
+- Select flatten relations from the candidate list that are most likely to help answer the question
 - Rank them by relevance (most relevant first)
 - Output **ONLY** a JSON list of strings in the exact format: `["relation1", "relation2", ...]`
 - Do not include any other text, explanations, or formatting
+
+## STRICT RULES (VERY IMPORTANT)
+
+1. You MUST select relations ONLY from the provided Candidate Flatten Relations list.
+   - Each selected string MUST be an EXACT character-by-character match to an item in the input list.
+   - Do NOT rename relations, do NOT change underscores/dots, do NOT add/remove numeric suffixes.
+2. You MUST NOT invent new relations.
+3. You MUST NOT output an empty list if at least one candidate relation is provided.
+4. Output length rules:
+   - If the input list has at least 8 candidates, return EXACTLY 8 DISTINCT relations.
+   - If the input list has fewer than 8 candidates, return ALL candidates (still non-empty), and do NOT pad with invented items.
 
 ## Important Notes
 
@@ -36,7 +47,7 @@ You will be provided with:
    - Represent semantic paths that logically lead to the answer
    - Avoid metadata or type-system relations unless they are clearly relevant
 
-3. **Output Format**: Your response must be a valid JSON array of exactly 8 relation strings (or fewer if fewer than 8 candidates are provided)
+3. **Output Format**: Your response must be a valid JSON array following the Output length rules above
 
 
 ## Example 

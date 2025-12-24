@@ -285,7 +285,7 @@ actor_rollout_ref:
     search:
       enable: True
       search_url: "http://127.0.0.1:8001/retrieve"
-      max_turns: 7
+      max_turns: 10
       topk: 3
       enable_during_training: False
       enable_during_validation: True
@@ -404,7 +404,7 @@ reward_model:
     # OTC (Optimal Turn Count) scaling configuration - set to false by default
     otc_scaling: false
     # Maximum number of turns for OTC scaling calculation
-    max_turns: 7
+    max_turns: 10
 
 # custom reward function definition
 custom_reward_function:

@@ -10,6 +10,7 @@ ray_tmp/
 logs/
 rollout_trajectories/
 *.log
+verl_checkpoints/
 
 # Python cache files
 __pycache__/

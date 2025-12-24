@@ -59,7 +59,7 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         
         # OTC (Optimal Turn Count) scaling configuration
         self.otc_scaling = reward_kwargs.get('otc_scaling', False)
-        self.max_turns = reward_kwargs.get('max_turns', 7)  # Default max turns
+        self.max_turns = reward_kwargs.get('max_turns', 10)  # Default max turns
         
         if self.verbose:
             print(f"[MultiTurnReward] Turn weights: {self.turn_specific_weights}")
@@ -1118,6 +1118,42 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             f1 = 2 * precision * recall / (precision + recall)
         
         return {'f1': f1, 'precision': precision, 'recall': recall}
+
+    def _token_f1_precision_recall(self, pred: str, golds: List[str]) -> Dict[str, float]:
+        """Reference token-level F1/precision/recall (matches kgqa_agent/src/eval/metrics.py).
+
+        We merge all parsed prediction candidates and gold answers into token sets
+        using the kgqa_agent normalization, then compute the overlap-based scores.
+        """
+        preds = self._parse_prediction_kgqa_agent(pred)
+        if not preds:
+            return {'f1': 0.0, 'precision': 0.0, 'recall': 0.0}
+
+        pred_tokens = set()
+        for p in preds:
+            normalized = self._qa_normalize_answer(p)
+            pred_tokens.update(normalized.split())
+
+        if not pred_tokens:
+            return {'f1': 0.0, 'precision': 0.0, 'recall': 0.0}
+
+        gold_tokens = set()
+        for g in golds or []:
+            normalized = self._qa_normalize_answer(str(g))
+            gold_tokens.update(normalized.split())
+
+        if not gold_tokens:
+            return {'f1': 0.0, 'precision': 0.0, 'recall': 0.0}
+
+        common = len(pred_tokens & gold_tokens)
+        if common == 0:
+            return {'f1': 0.0, 'precision': 0.0, 'recall': 0.0}
+
+        precision = common / len(pred_tokens)
+        recall = common / len(gold_tokens)
+        f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+
+        return {'f1': f1, 'precision': precision, 'recall': recall}
     
     def _calculate_exact_match_reward(self, data_item, interaction_history: Dict) -> float:
         """
@@ -1179,6 +1215,14 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             entity_level_f1 = entity_metrics['f1']
             entity_level_precision = entity_metrics['precision']
             entity_level_recall = entity_metrics['recall']
+
+            # Fallback: if EM says correct but F1 is zero, recompute using reference token F1
+            if entity_level_exact_match and entity_level_f1 == 0.0:
+                token_metrics = self._token_f1_precision_recall(predicted_answer or "", ground_truth_answers)
+                if token_metrics['f1'] > 0.0:
+                    entity_level_f1 = token_metrics['f1']
+                    entity_level_precision = token_metrics['precision']
+                    entity_level_recall = token_metrics['recall']
         
         # Store metrics for WandB logging
         if not hasattr(data_item, 'answer_metrics'):
@@ -1898,18 +1942,19 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             # Turn-wise metrics using stored components
             if turn_components:
                 # Extract components for each turn
-                kg_query_validity_values = []
+                kg_query_validity_values = []  # (action, value)
                 is_answer_values = []
                 format_score_values = []
                 
                 for turn_num, components in turn_components.items():
-                    kg_query_validity_values.append(components.get('kg_query_validity', 0.0))
+                    kg_query_validity_values.append((components.get('action'), components.get('kg_query_validity', 0.0)))
                     is_answer_values.append(components.get('is_answer_score', 0.0))
                     format_score_values.append(components.get('format_score', 0.0))
                 
-                # Turn-wise averages
+                # Turn-wise averages (exclude forced final answer turns from kg-query validity)
+                search_kg_validity = [val for action, val in kg_query_validity_values if action == 'kg-query']
                 wandb_metrics['turn_kg_query_validity'].append(
-                    sum(kg_query_validity_values) / len(kg_query_validity_values) if kg_query_validity_values else 0.0
+                    sum(search_kg_validity) / len(search_kg_validity) if search_kg_validity else 0.0
                 )
                 
                 wandb_metrics['turn_format_score'].append(
