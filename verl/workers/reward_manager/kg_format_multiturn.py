@@ -1027,10 +1027,31 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         return 'kgqa_agent' in data_source or 'kgqa_agent_format' in data_source
     
     def _qa_normalize_answer(self, s: str) -> str:
-        """kgqa_agent-style normalization: lowercase, remove 'a'/'an', normalize whitespace, but keep punctuation."""
+        """kgqa_agent-style normalization: lowercase, remove articles, remove punctuation, normalize unicode.
+        
+        CRITICAL FIX: Added unicodedata normalization to handle accented characters.
+        Without this, 'Hôtel' and 'Hotel' are treated as different strings, causing false negatives.
+        """
+        import string
+        import unicodedata
+        
+        # Normalize unicode characters (é→e, ô→o, etc.)
+        # NFD decomposes combined characters, then filter out combining marks
+        s = unicodedata.normalize('NFD', s)
+        s = ''.join(char for char in s if unicodedata.category(char) != 'Mn')
+        
+        # Lowercase
         s = s.lower()
-        s = re.sub(r"\b(a|an)\b", " ", s)
+        
+        # Remove punctuation
+        s = ''.join(char if char not in string.punctuation else ' ' for char in s)
+        
+        # Remove articles
+        s = re.sub(r"\b(a|an|the)\b", " ", s)
+        
+        # Normalize whitespace
         s = " ".join(s.split())
+        
         return s
     
     def _parse_prediction_kgqa_agent(self, pred: str) -> List[str]:

@@ -6,9 +6,9 @@ set -euo pipefail
 # -----------------------------
 export CUDA_VISIBLE_DEVICES=0,1
 export DATA_DIR="${DATA_DIR:-data_kg}"
-export BASE_MODEL="${BASE_MODEL:-/mnt/usercache/yuanchenhao/LLaMA-Factory/saves/qwen2.5_3b_it_sft_traj_synth_filtered_7k_deepseekv3_2/lr1e-5_ep2}"
+export BASE_MODEL="${BASE_MODEL:-/mnt/usercache/yuanchenhao/LLaMA-Factory/saves/qwen2.5_3b_it_sft_traj_roll_10k_4o-mini_cutoff4096_filter_max_calls_sample_3k/lr1e-5_ep2}"
 export WAND_PROJECT="${WAND_PROJECT:-KG-R1-debug}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-cwq-2a100-test-3b}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-cwq-2a100-test-3b-roll-3k}"
 
 export RAY_TMPDIR=/mnt/usercache/yuanchenhao/KG-R1/ray_tmp
 
@@ -40,7 +40,7 @@ python -m verl.trainer.main_ppo \
     trainer.resume_mode=disable \
     trainer.rollout_data_dir=rollout_trajectories/$ROLLOUT_DIR \
     trainer.save_freq=20 \
-    trainer.test_freq=20 \
+    trainer.test_freq=200 \
     trainer.logger='["wandb"]' \
     data.train_files=$DATA_DIR/cwq_kgqa_agent_format/train.parquet \
     data.val_files=$DATA_DIR/cwq_kgqa_agent_format/val.parquet \
@@ -92,11 +92,11 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=80000 \
     reward_model.enable=false \
     reward_model.reward_manager=kg_format_multiturn \
-    +reward_model.reward_kwargs.turn_kg_query_validity=0.10 \
-    +reward_model.reward_kwargs.turn_is_answer_score=0.10 \
-    +reward_model.reward_kwargs.turn_format_score=0.20 \
-    +reward_model.reward_kwargs.global_exact_match=0.50 \
-    +reward_model.reward_kwargs.global_retrieval_quality=0.20 \
+    +reward_model.reward_kwargs.turn_kg_query_validity=0.0 \
+    +reward_model.reward_kwargs.turn_is_answer_score=0.0 \
+    +reward_model.reward_kwargs.turn_format_score=0.0 \
+    +reward_model.reward_kwargs.global_exact_match=1.0 \
+    +reward_model.reward_kwargs.global_retrieval_quality=0.5 \
     +reward_model.reward_kwargs.verbose=true \
     algorithm.kg_token_masking.enable=false \
     +trainer.use_ref_model=true \

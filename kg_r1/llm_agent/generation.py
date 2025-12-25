@@ -275,9 +275,10 @@ class LLMGenerationManager:
         """Pre-compile all regex patterns for performance optimization."""
         # Patterns for postprocess_predictions
         # Note: <search> tag is not a valid tag in kgqa_agent mode, removed
-        self.kg_query_pattern1 = re.compile(r'<kg-query>(.*?)</kg-query>', re.DOTALL)  
+        # Use negative lookahead to prevent cross-tag matching (match content that doesn't contain opening tag)
+        self.kg_query_pattern1 = re.compile(r'<kg-query>((?:(?!<kg-query>).)*?)</kg-query>', re.DOTALL | re.IGNORECASE)  
         self.kg_query_pattern2 = re.compile(r'<kg-query\s+([^>]+)\s*/>', re.DOTALL)
-        self.answer_pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
+        self.answer_pattern = re.compile(r'<answer>((?:(?!<answer>).)*?)</answer>', re.DOTALL | re.IGNORECASE)
         self.think_pattern = re.compile(r'<think>(.*?)</think>', re.DOTALL)
         
         # Patterns for _parse_kg_query
@@ -599,6 +600,9 @@ class LLMGenerationManager:
         # When using rollouts (e.g., grpo_rollout_n=8), the batch is already expanded
         actual_batch_size = gen_batch.batch['input_ids'].shape[0]
         
+        # Track consecutive format errors per sample (for error loop prevention)
+        consecutive_format_errors = [0] * actual_batch_size
+        
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {
             'responses': initial_input_ids[:, []], 
@@ -680,7 +684,8 @@ class LLMGenerationManager:
             # and the model should respond with <answer> tag, which will set done=True
             print(f"[DEBUG-GENERATION] Step {step+1}: Calling execute_predictions for {active_count} samples...")
             next_obs, dones, valid_action, is_search, raw_server_responses = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, gen_batch.meta_info, active_mask
+                responses_str, self.tokenizer.pad_token, gen_batch.meta_info, active_mask,
+                consecutive_format_errors=consecutive_format_errors
             )
             print(f"[DEBUG-GENERATION] Step {step+1}: execute_predictions completed, {sum(dones)}/{active_count} samples done")
             
@@ -754,7 +759,8 @@ class LLMGenerationManager:
             
             # Final turn: do_search=False to prevent further queries, force answer
             next_obs, dones, valid_action, is_search, raw_server_responses = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, gen_batch.meta_info, active_mask, do_search=False
+                responses_str, self.tokenizer.pad_token, gen_batch.meta_info, active_mask, do_search=False,
+                consecutive_format_errors=consecutive_format_errors
             )
             
             # Store final turn interaction details
@@ -909,7 +915,7 @@ class LLMGenerationManager:
         
         return final_output_proto # Return DataProto object
 
-    def execute_predictions(self, predictions: List[str], pad_token: str, meta_info: Dict, active_mask=None, do_search=True) -> Tuple[List[str], List[bool], List[int], List[int], List[Dict]]:
+    def execute_predictions(self, predictions: List[str], pad_token: str, meta_info: Dict, active_mask=None, do_search=True, consecutive_format_errors=None) -> Tuple[List[str], List[bool], List[int], List[int], List[Dict]]:
         """
         Execute predictions across multiple environments.
         NOTE: the function is the actual `step` function in the environment
@@ -920,12 +926,17 @@ class LLMGenerationManager:
             predictions: List of action predictions
             pad_token: Token to use for padding
             meta_info: Dict containing batch-level metadata OR per-sample metadata
+            consecutive_format_errors: List[int] tracking consecutive format errors per sample
             
         Returns:
             Tuple of (next_obs, dones, valid_action, is_search, raw_server_responses)
         """
         if meta_info is None:
             meta_info = {}
+        
+        # Initialize consecutive_format_errors if not provided (for backward compatibility)
+        if consecutive_format_errors is None:
+            consecutive_format_errors = [0] * len(predictions)
 
         cur_actions, contents, _ = self.postprocess_predictions(predictions)
         session_keys = self._build_bridge_session_keys(meta_info, len(cur_actions)) if self.use_sparql_bridge else []
@@ -1002,12 +1013,16 @@ class LLMGenerationManager:
                 raw_server_responses.append({})
             else:
                 if action == 'answer':
+                    # Reset consecutive format errors on successful action
+                    consecutive_format_errors[i] = 0
                     next_obs.append('')
                     dones.append(1)
                     valid_action.append(1)
                     is_search.append(0)
                     raw_server_responses.append({})
                 elif action == 'kg-query':
+                    # Reset consecutive format errors on successful action
+                    consecutive_format_errors[i] = 0
                     # CRITICAL FIX: Use the mapping to get the correct response for this sample
                     if i in kg_response_map:
                         kg_result, raw_kg_response = kg_response_map[i]
@@ -1025,7 +1040,8 @@ class LLMGenerationManager:
                             continuation = build_continuation_prompt(kg_result.strip())
                             # Append FORCE_ANSWER_PROMPT after continuation to force answer
                             # Note: continuation already includes <information> and guidance text
-                            next_obs.append(f'\n\n{continuation}\n\n{FORCE_ANSWER_PROMPT}')
+                            # Add <think> tag after user message to guide model thinking
+                            next_obs.append(f'\n\n{continuation}\n\n{FORCE_ANSWER_PROMPT}\n<think>')
                             raw_server_responses.append(raw_kg_response)
                             dones.append(1)  # Force done to end conversation after model answers
                             valid_action.append(1)  # The query itself was valid
@@ -1036,7 +1052,7 @@ class LLMGenerationManager:
                             continuation = build_continuation_prompt(kg_result.strip())
                             # The continuation prompt already includes <information> and guidance text
                             # Add <think> tag at the end to guide model thinking
-                            next_obs.append(f'\n\n{continuation}')
+                            next_obs.append(f'\n\n{continuation}\n<think>')
                             raw_server_responses.append(raw_kg_response)
                             dones.append(0)  # Continue conversation
                             # Fix: KG queries are invalid if search is disabled (final turn)
@@ -1047,7 +1063,8 @@ class LLMGenerationManager:
                             is_search.append(1)
                     else:
                         # Fallback if something went wrong
-                        next_obs.append(f'\n\n<information>Error: No response found for this query</information>\n\n')
+                        # Add <think> tag after error message to guide model thinking
+                        next_obs.append(f'\n\n<information>Error: No response found for this query</information>\n\n<think>')
                         raw_server_responses.append({"error": "No response mapped"})
                         dones.append(0)
                         valid_action.append(0)
@@ -1055,13 +1072,28 @@ class LLMGenerationManager:
                 # Note: <search> tag is not a valid tag in kgqa_agent mode, removed
                 # If model outputs <search>, it will be treated as 'error' action
                 else:
+                    # Update consecutive format error count
+                    consecutive_format_errors[i] += 1
+                    
                     # Check if this is a length-exceeded response
                     if response_length_exceeded[i]:
                         # Add <think> tag after information to guide model thinking
-                        next_obs.append(f'\n\n<information>Your previous response was too long ({contents[i]}). Please provide shorter responses within the token limit.</information>')
+                        next_obs.append(f'\n\n<information>Your previous response was too long ({contents[i]}). Please provide shorter responses within the token limit.</information>\n<think>')
+                    elif consecutive_format_errors[i] >= 3:
+                        # After 3 consecutive format errors, provide critical guidance (aligned with eval side)
+                        # Note: eval side retries 3 times then continues, we provide stronger guidance
+                        next_obs.append(
+                            f'\n\n<information>CRITICAL: You have made {consecutive_format_errors[i]} '
+                            f'consecutive format errors. You MUST output EITHER:\n'
+                            f'1. <kg-query>get_relations("entity")</kg-query> to search the knowledge graph, OR\n'
+                            f'2. <answer>["Entity1", "Entity2"]</answer> to provide your final answer.\n'
+                            f'No other format is accepted. Follow the exact tag format shown above.</information>\n<think>'
+                        )
+                        # Continue allowing the model to retry (don't force termination yet)
+                        # This gives the model one more chance with stronger guidance
                     else:
                         # Add <think> tag after information to guide model thinking
-                        next_obs.append(f'\n\n<information>Your previous action is invalid. You should put the query between <kg-query> and </kg-query> if you want to search, or put the answer between <answer> and </answer> if you want to give the final answer.</information>')
+                        next_obs.append(f'\n\n<information>Your previous action is invalid. You should put the query between <kg-query> and </kg-query> if you want to search, or put the answer between <answer> and </answer> if you want to give the final answer.</information>\n<think>')
                     dones.append(0)
                     valid_action.append(0)
                     is_search.append(0)
@@ -1139,17 +1171,36 @@ class LLMGenerationManager:
                 # Determine action based on actual tag order
                 candidates: List[Tuple[str, int, str]] = []
 
-                answer_match = self.answer_pattern.search(prediction)
-                if answer_match:
-                    candidates.append(("answer", answer_match.start(), answer_match.group(1).strip()))
+                # Use findall to get all matches, then take the last one to align with eval side
+                answer_matches = self.answer_pattern.findall(prediction)
+                if answer_matches:
+                    # Take the last match and find its position
+                    last_answer_content = answer_matches[-1].strip()
+                    # Find the position of the last match
+                    last_match = None
+                    for match in self.answer_pattern.finditer(prediction):
+                        last_match = match
+                    if last_match:
+                        candidates.append(("answer", last_match.start(), last_answer_content))
 
-                kg_query_match = self.kg_query_pattern1.search(prediction)
-                if kg_query_match:
-                    candidates.append(("kg-query", kg_query_match.start(), kg_query_match.group(1).strip()))
+                # For kg-query, also take the last match to be consistent
+                kg_query_matches = self.kg_query_pattern1.findall(prediction)
+                if kg_query_matches:
+                    last_kg_content = kg_query_matches[-1].strip()
+                    last_match = None
+                    for match in self.kg_query_pattern1.finditer(prediction):
+                        last_match = match
+                    if last_match:
+                        candidates.append(("kg-query", last_match.start(), last_kg_content))
                 else:
-                    kg_query_match2 = self.kg_query_pattern2.search(prediction)
-                    if kg_query_match2:
-                        candidates.append(("kg-query", kg_query_match2.start(), kg_query_match2.group(1).strip()))
+                    kg_query_matches2 = self.kg_query_pattern2.findall(prediction)
+                    if kg_query_matches2:
+                        last_kg_content = kg_query_matches2[-1].strip()
+                        last_match = None
+                        for match in self.kg_query_pattern2.finditer(prediction):
+                            last_match = match
+                        if last_match:
+                            candidates.append(("kg-query", last_match.start(), last_kg_content))
 
                 # Note: <search> tag is not a valid tag in kgqa_agent mode, removed
                 # Only match <answer> and <kg-query> tags

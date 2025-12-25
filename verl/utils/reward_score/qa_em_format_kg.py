@@ -102,7 +102,13 @@ def _remove_temporal_annotations_multitq(text):
 
 
 def normalize_answer(s, dataset_name=None):
-    """Normalize answer for comparison"""
+    """Normalize answer for comparison.
+    
+    CRITICAL FIX: Added Unicode normalization to handle accented characters.
+    Without this, 'Hôtel' and 'Hotel' are treated as different strings.
+    """
+    import unicodedata
+    
     def remove_articles(text):
         return re.sub(r'\b(a|an|the)\b', ' ', text)
 
@@ -115,6 +121,13 @@ def normalize_answer(s, dataset_name=None):
 
     def lower(text):
         return text.lower()
+    
+    def normalize_unicode(text):
+        """Normalize Unicode characters: decompose then remove combining marks."""
+        # NFD: Decompose combined characters (é → e + ́)
+        text = unicodedata.normalize('NFD', text)
+        # Filter out combining marks (accents, diacritics)
+        return ''.join(char for char in text if unicodedata.category(char) != 'Mn')
 
     # Check for MultiTQ temporal normalization before standard processing
     if dataset_name and dataset_name.lower() in ['multitq', 'kgr1_multitq']:
@@ -131,10 +144,11 @@ def normalize_answer(s, dataset_name=None):
             return temporal_normalized
         else:
             # No temporal conversion happened, proceed with standard normalization on cleaned text
-            return white_space_fix(remove_articles(remove_punc(lower(text_without_annotations))))
+            return white_space_fix(remove_articles(remove_punc(normalize_unicode(lower(text_without_annotations)))))
     else:
         # Standard normalization for non-MultiTQ datasets
-        return white_space_fix(remove_articles(remove_punc(lower(s))))
+        # CRITICAL FIX: Added normalize_unicode() to handle accented characters
+        return white_space_fix(remove_articles(remove_punc(normalize_unicode(lower(s)))))
 
 
 def strip_information_blocks(text: str) -> str:
@@ -387,10 +401,14 @@ def extract_year_from_timestamps(extracted_answer: str) -> str:
 def em_check_kg(prediction: str, golden_answers: Union[str, List[str]], dataset_name: str = None, verbose: bool = False, interaction_history: Dict = None) -> float:
     """KG-aware exact match check with enhanced answer extraction and list handling.
     
-    This function expects pre-filtered assistant response content.
+    CRITICAL FIX: This function should receive already-extracted answer content,
+    not the full assistant response. Callers are expected to call extract_answer_kg()
+    before passing to this function. Double extraction causes the bug where valid
+    answers like '["Harry Mendler", "Leah Mendler"]' fail because extract_answer_kg()
+    tries to find <answer> tags in an already-extracted answer.
     
     Args:
-        prediction: The prediction text from the model
+        prediction: The ALREADY EXTRACTED prediction text (not full assistant response)
         golden_answers: Ground truth answer(s) 
         dataset_name: Dataset name for dataset-specific normalization (e.g., "multitq")
         verbose: If True, print detailed normalization steps
@@ -398,12 +416,13 @@ def em_check_kg(prediction: str, golden_answers: Union[str, List[str]], dataset_
     if isinstance(golden_answers, str):
         golden_answers = [golden_answers]
     
-    # Extract answer from prediction using KG-aware extraction
-    # Note: prediction should already be filtered to assistant response only
-    extracted_answer = extract_answer_kg(prediction)
-    if extracted_answer is None:
+    # CRITICAL FIX: Use prediction directly, do NOT extract again
+    # The caller (e.g., _calculate_exact_match_reward) has already called extract_answer_kg()
+    # Double extraction causes None return when the answer is valid but lacks <answer> tags
+    extracted_answer = prediction
+    if not extracted_answer:
         if verbose:
-            print(f"[EM-DEBUG] No answer tags found in prediction")
+            print(f"[EM-DEBUG] Empty prediction")
         return 0
     
     # Normalize all ground truth answers
@@ -593,31 +612,73 @@ def extract_answer_kg(solution_str: str) -> Union[str, None]:
     Unlike the general case that requires 2+ answer tags, 
     KG responses should have exactly one answer tag.
     This function expects pre-filtered assistant response content.
+    
+    CRITICAL FIX: Skip tags wrapped in backticks (e.g., `<answer>` in prompts).
+    Only extract content from actual <answer>...</answer> tags that are NOT
+    preceded by a backtick. This prevents matching prompt examples like:
+    "provide your answer in `<answer>` tags"
     """
     # First, remove all <information>...</information> content
     # This prevents error messages from contaminating answer extraction
     cleaned_str = strip_information_blocks(solution_str)
     cleaned_str = strip_chatml_tokens(cleaned_str)
 
-    # Now search for answer tags in the cleaned string
-    answer_pattern = r'<answer>(.*?)</answer>'
-    matches = re.findall(answer_pattern, cleaned_str, re.DOTALL)
+    def is_wrapped_in_backticks(text: str, tag_start_idx: int) -> bool:
+        """Check if a tag at tag_start_idx is wrapped in backticks.
+        
+        Returns True if there's a backtick immediately before the tag.
+        Example: "`<answer>`" would return True
+        """
+        if tag_start_idx > 0 and text[tag_start_idx - 1] == '`':
+            return True
+        return False
+
+    # Find ALL <answer> tags (case-insensitive)
+    lower_cleaned = cleaned_str.lower()
+    search_start = 0
+    last_valid_open_idx = -1
     
-    if len(matches) == 0:
-        lower_cleaned = cleaned_str.lower()
-        open_idx = lower_cleaned.rfind("<answer>")
-        close_idx = lower_cleaned.find("</answer>")
-        if open_idx != -1 and close_idx == -1:
-            fallback = cleaned_str[open_idx + len("<answer>"):]
-            return fallback.strip() if fallback.strip() else None
-        if close_idx != -1 and open_idx == -1:
-            fallback = cleaned_str[:close_idx]
-            return fallback.strip() if fallback.strip() else None
+    # Search for the LAST <answer> tag that is NOT wrapped in backticks
+    while True:
+        open_idx = lower_cleaned.find("<answer>", search_start)
+        if open_idx == -1:
+            break
+        
+        # Check if this tag is wrapped in backticks
+        if not is_wrapped_in_backticks(cleaned_str, open_idx):
+            last_valid_open_idx = open_idx
+        
+        search_start = open_idx + 1
+    
+    if last_valid_open_idx == -1:
+        # No valid opening tag found - try to find valid closing tag
+        # This handles edge cases but should rarely happen in normal usage
         return None
     
-    # For KG responses, we expect exactly one answer tag
-    # If there are multiple, take the first one
-    return matches[0]
+    # Found valid opening tag - look for valid closing tag AFTER it
+    search_start = last_valid_open_idx + len("<answer>")
+    valid_close_idx = -1
+    
+    while True:
+        close_idx = lower_cleaned.find("</answer>", search_start)
+        if close_idx == -1:
+            break
+        
+        # Check if this closing tag is wrapped in backticks
+        if not is_wrapped_in_backticks(cleaned_str, close_idx):
+            valid_close_idx = close_idx
+            break
+        
+        search_start = close_idx + 1
+    
+    if valid_close_idx == -1:
+        # No valid closing tag - extract everything after opening tag
+        fallback = cleaned_str[last_valid_open_idx + len("<answer>"):]
+        return fallback.strip() if fallback.strip() else None
+    
+    # Extract content between the LAST valid opening tag and its closing tag
+    content = cleaned_str[last_valid_open_idx + len("<answer>"):valid_close_idx]
+    return content.strip() if content.strip() else None
 
 def is_retrieval_correct_kg(text: str, golden_answers: List[str], interaction_history: Dict, dataset_name: str = None) -> bool:
     """Check if the retrieval contains the correct answer using actual retrieval results.

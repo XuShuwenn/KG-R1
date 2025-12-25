@@ -81,6 +81,8 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 # Import Role enum from the original trainer to ensure compatibility
 from verl.trainer.ppo.ray_trainer import Role
+# Import answer extraction utilities to fix prediction extraction from multi-turn conversations
+from verl.utils.reward_score.qa_em_format_kg import extract_assistant_response, extract_answer_kg
 
 # Debug-only prints in this file can be very verbose. Keep them off by default.
 _DEBUG_TRAINER = os.environ.get("VERL_TRAINER_DEBUG", "0").lower() not in {"0", "false", ""}
@@ -1166,6 +1168,11 @@ class RayPPOTrainer:
 
         def _extract_prediction_from_text(text):
             """Extract model prediction from <answer>...</answer>.
+            
+            CRITICAL FIX: For multi-turn conversations, we must extract the last
+            assistant response FIRST using extract_assistant_response(), then use
+            extract_answer_kg() to properly handle nested/incomplete answer tags.
+            Otherwise, we may match <answer> tags from earlier turns or prompt examples.
 
             Returns:
                 - parsed JSON (usually list[str]) when possible
@@ -1184,6 +1191,33 @@ class RayPPOTrainer:
                     return None
             if not isinstance(text, str):
                 return None
+
+            # CRITICAL FIX Step 1: Extract last assistant response from multi-turn conversation
+            # This prevents matching <answer> tags from earlier turns or prompt examples
+            try:
+                last_assistant_text = extract_assistant_response(text)
+                if last_assistant_text:
+                    text = last_assistant_text
+            except Exception:
+                # If extraction fails, fall back to original text
+                # (single-turn case or parsing error)
+                pass
+
+            # CRITICAL FIX Step 2: Use extract_answer_kg() to properly handle nested/incomplete tags
+            # This handles cases where the text contains "<answer>" in descriptions
+            try:
+                answer_content = extract_answer_kg(text)
+                if answer_content is None:
+                    return None
+                # Try to parse as JSON first
+                try:
+                    return json.loads(answer_content)
+                except Exception:
+                    # Return raw string if JSON parsing fails
+                    return answer_content
+            except Exception:
+                # Fallback to old regex-based extraction
+                pass
 
             def _strip_code_fence(s: str) -> str:
                 s = s.strip()
