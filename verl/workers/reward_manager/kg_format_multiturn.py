@@ -1379,13 +1379,11 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         # Parse ground truth structure
         if isinstance(ground_truth_raw, dict):
             target_texts = ground_truth_raw.get("target_text", [])
-            target_kb_ids = ground_truth_raw.get("target_kb_id", [])
+            # NOTE: Only use target_text for F1 calculation, ignore target_kb_id
 
-            # Ensure both are lists
+            # Ensure target_texts is a list
             if not isinstance(target_texts, list):
                 target_texts = [target_texts] if target_texts else []
-            if not isinstance(target_kb_ids, list):
-                target_kb_ids = [target_kb_ids] if target_kb_ids else []
         else:
             # Fallback to original method for non-dict ground truth
             if isinstance(ground_truth_raw, str):
@@ -1427,28 +1425,22 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             return {'f1': f1, 'precision': precision, 'recall': recall}
 
         # Build normalized ground truth entity set
-        # For dict-based ground truth, each index is a distinct entity with possible text/kb_id variants
-        # IMPORTANT: text and kb_id at the SAME index are alternative representations of the SAME entity
-        num_entities = max(len(target_texts), len(target_kb_ids))
+        # For dict-based ground truth, each target_text entry is a distinct entity
+        # NOTE: Only use target_text, ignore target_kb_id
+        num_entities = len(target_texts)
         if num_entities == 0:
             return {'f1': 0.0, 'precision': 0.0, 'recall': 1.0}
 
-        # Build list of ground truth entities where each entity has alternative representations
+        # Build list of ground truth entities (each is just the text form)
         ground_truth_entities = []
         for i in range(num_entities):
             entity_representations = set()
 
-            # Add text form
+            # Add text form only (no kb_id)
             if i < len(target_texts) and target_texts[i]:
                 normalized_text = normalize_answer(str(target_texts[i]))
                 if normalized_text:
                     entity_representations.add(normalized_text)
-
-            # Add kb_id form (alternative representation of the SAME entity)
-            if i < len(target_kb_ids) and target_kb_ids[i]:
-                normalized_kb = normalize_answer(str(target_kb_ids[i]))
-                if normalized_kb:
-                    entity_representations.add(normalized_kb)
 
             if entity_representations:
                 ground_truth_entities.append(entity_representations)
@@ -1565,18 +1557,15 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             # Now handle the parsed structure using the same logic as kg_format.py
             if isinstance(ground_truth_raw, dict):
                 target_texts = ground_truth_raw.get("target_text", [])
-                target_kb_ids = ground_truth_raw.get("target_kb_id", [])
+                # NOTE: Only use target_text for F1 calculation, ignore target_kb_id
                 
-                # Ensure both are lists
+                # Ensure target_texts is a list
                 if not isinstance(target_texts, list):
                     target_texts = [target_texts] if target_texts else []
-                if not isinstance(target_kb_ids, list):
-                    target_kb_ids = [target_kb_ids] if target_kb_ids else []
                 
-                # Combine both target_text and target_kb_id as potential answers
+                # Use only target_text as ground truth answers (no target_kb_id)
                 ground_truth_answers = []
                 ground_truth_answers.extend([str(text) for text in target_texts if text])
-                ground_truth_answers.extend([str(kb_id) for kb_id in target_kb_ids if kb_id])
                 
                 # Remove duplicates while preserving order
                 seen = set()
