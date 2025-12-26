@@ -65,7 +65,7 @@ class DirectSPARQLKGClient:
         
         here = os.path.dirname(__file__)
         repo_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
-        wl_path = os.path.join(repo_root, "datasets", "cwq", "cwq_predicates", "filtered_cwq_white_list.json")
+        wl_path = os.path.join(repo_root, "filtered_cwq_white_list.json")
         with open(wl_path, "r", encoding="utf-8") as f:
             uris = json.load(f)
 

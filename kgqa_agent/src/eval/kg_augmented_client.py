@@ -670,6 +670,16 @@ class KGAugmentedModelClient(BaseModelClient):
             return extracted
         
         cleaned = response
+        # Lightweight: remove ChatML role markers that may be left in responses
+        # Examples: <|im_start|>assistant, <|im_start|>user, and <|im_end|>
+        cleaned = re.sub(r"<\|im_start\|>\s*assistant", "", cleaned)
+        cleaned = re.sub(r"<\|im_start\|>\s*user", "", cleaned)
+        cleaned = cleaned.replace("<|im_end|>", "")
+        # Remove isolated lines containing only 'assistant' or 'user' (trim safely)
+        cleaned = re.sub(r"(?m)^[ \t]*assistant[ \t]*$\n?", "", cleaned)
+        cleaned = re.sub(r"(?m)^[ \t]*user[ \t]*$\n?", "", cleaned)
+
+        # Remove KG-related tags and info blocks as before
         cleaned = re.sub(r'<think>.*?</think>', '', cleaned, flags=re.DOTALL)
         cleaned = re.sub(r'<kg-query>.*?</kg-query>', '', cleaned, flags=re.DOTALL)
         cleaned = re.sub(r'<information>.*?</information>', '', cleaned, flags=re.DOTALL)
