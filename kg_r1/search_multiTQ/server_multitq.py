@@ -4,6 +4,12 @@ FastAPI server for MultiTQ Knowledge Graph Retrieval.
 Handles temporal KGQA with split-wise knowledge graphs.
 """
 
+# NOTE(kgqa_agent mode): SPARQL-bridge training does not use this legacy MultiTQ
+# FastAPI KG server. Keep code below for reference, but comment it out.
+raise RuntimeError("kg_r1.search_multiTQ.server_multitq is legacy and disabled in kgqa_agent mode")
+
+'''
+
 import time
 import logging
 import asyncio
@@ -304,3 +310,5 @@ if __name__ == "__main__":
     
     # Run server
     run_server()
+
+'''

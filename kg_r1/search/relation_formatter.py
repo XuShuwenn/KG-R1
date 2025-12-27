@@ -5,6 +5,13 @@ This module provides functions to convert flat Freebase relation lists into
 hierarchical structures for improved token efficiency and readability.
 """
 
+# NOTE(kgqa_agent mode): SPARQL-bridge training does not use the legacy KG-R1
+# FastAPI server output formatting. Preserve the code below for reference, but
+# comment it out to avoid accidental usage.
+raise RuntimeError("kg_r1.search.relation_formatter is legacy and disabled in kgqa_agent mode")
+
+'''
+
 import os
 from collections import defaultdict
 from typing import List, Dict, Any
@@ -241,3 +248,5 @@ def estimate_token_savings(relations: List[str], target_format: RelationFormat =
         'savings_percent': savings_percent,
         'relation_count': len(relations)
     }
+
+'''

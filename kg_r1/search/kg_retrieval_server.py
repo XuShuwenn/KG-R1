@@ -13,6 +13,13 @@ Environment Variables:
     KG_THREAD_WORKERS: Number of ThreadPoolExecutor workers
 """
 
+# NOTE(kgqa_agent mode): This entrypoint starts the legacy FastAPI KG retrieval
+# server, which is not used when training/evaluating with the kgqa_agent SPARQL
+# bridge. Keep the original code below for reference, but comment it out.
+raise RuntimeError("kg_r1.search.kg_retrieval_server is legacy and disabled in kgqa_agent mode")
+
+'''
+
 import argparse
 import logging
 import os
@@ -81,3 +88,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+'''

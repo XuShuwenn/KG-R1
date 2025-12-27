@@ -185,7 +185,16 @@ class vLLMRollout(BaseRollout):
         # supporting adding any sampling params from the config file
         for k in config.keys():
             if hasattr(SamplingParams(), str(k)):
-                kwargs[k] = config.get(k)
+                value = config.get(k)
+                # Convert OmegaConf containers (ListConfig/DictConfig) to native Python types
+                if hasattr(value, '__class__') and hasattr(value.__class__, '__module__'):
+                    if 'omegaconf' in value.__class__.__module__.lower():
+                        value = OmegaConf.to_container(value, resolve=True)
+                kwargs[k] = value
+
+        # vLLM requires detokenize=True when using stop strings
+        if 'stop' in kwargs and kwargs['stop']:
+            kwargs["detokenize"] = True
 
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)

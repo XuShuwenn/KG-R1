@@ -3,6 +3,11 @@
 Test script for MultiTQ KG server.
 """
 
+# NOTE(kgqa_agent mode): legacy MultiTQ server test script is not used.
+raise RuntimeError("kg_r1.search_multiTQ.test_multitq is legacy and disabled in kgqa_agent mode")
+
+'''
+
 import sys
 import time
 import requests
@@ -142,3 +147,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+'''

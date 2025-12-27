@@ -779,7 +779,7 @@ algorithm:
     reduction_factor: 0.1
 
     # List of specific patterns to mask (JSON string format when passed via command line)
-    patterns: ["<kg-query>", "</kg-query>", "<search>", "</search>", "<think>", "</think>", "get_tail_relations", "get_head_relations", "get_tail_entities", "get_head_entities", "get_conditional_relations"]
+    patterns: ["<kg-query>", "</kg-query>", "<search>", "</search>", "<think>", "</think>", "get_tail_relations", "get_head_relations", "get_tail_entities", "get_head_entities", "get_conditional_relations", "get_relations", "get_triples"]
 
     # Whether to enable debug logging for masked tokens
     debug_logging: false

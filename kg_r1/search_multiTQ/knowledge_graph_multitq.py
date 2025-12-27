@@ -5,6 +5,12 @@ This module handles temporal knowledge graphs from MultiTQ dataset,
 using split-wise KG files (train.txt, valid.txt, test.txt) instead of per-sample subgraphs.
 """
 
+# NOTE(kgqa_agent mode): SPARQL-bridge training does not use the legacy MultiTQ
+# split-wise KG loader. Preserve code below for reference, but comment it out.
+raise RuntimeError("kg_r1.search_multiTQ.knowledge_graph_multitq is legacy and disabled in kgqa_agent mode")
+
+'''
+
 import os
 import json
 from typing import Dict, List, Optional, Any, Set, Tuple
@@ -313,3 +319,5 @@ class KnowledgeGraphMultiTQ:
             filtered.append(quad)
         
         return filtered
+
+    '''

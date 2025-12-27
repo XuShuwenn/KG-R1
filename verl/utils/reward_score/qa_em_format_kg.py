@@ -439,7 +439,7 @@ def em_check_kg(prediction: str, golden_answers: Union[str, List[str]], dataset_
     )
     
     # Debug logging for MultiTQ detection
-    if verbose or True:  # Always show for debugging
+    if verbose:
         print(f"[DEBUG-MultiTQ] dataset_name: '{dataset_name}'")
         print(f"[DEBUG-MultiTQ] interaction_history data_source: '{interaction_history.get('data_source', '') if interaction_history else 'NO_HISTORY'}'")
         print(f"[DEBUG-MultiTQ] is_multitq: {is_multitq}")
@@ -676,9 +676,18 @@ def extract_answer_kg(solution_str: str) -> Union[str, None]:
         fallback = cleaned_str[last_valid_open_idx + len("<answer>"):]
         return fallback.strip() if fallback.strip() else None
     
+    def _require_bracketed_list(s: str) -> Union[str, None]:
+        s = (s or "").strip()
+        if not s:
+            return None
+        # Only accept JSON-list-like answers: [ ... ]
+        if not (s.startswith("[") and s.endswith("]")):
+            return None
+        return s
+
     # Extract content between the LAST valid opening tag and its closing tag
     content = cleaned_str[last_valid_open_idx + len("<answer>"):valid_close_idx]
-    return content.strip() if content.strip() else None
+    return _require_bracketed_list(content)
 
 def is_retrieval_correct_kg(text: str, golden_answers: List[str], interaction_history: Dict, dataset_name: str = None) -> bool:
     """Check if the retrieval contains the correct answer using actual retrieval results.

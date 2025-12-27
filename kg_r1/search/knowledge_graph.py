@@ -1,3 +1,13 @@
+"""Legacy KG-R1 local-subgraph KnowledgeGraph.
+
+NOTE(kgqa_agent mode): SPARQL-bridge training does not use the RoG subgraph
+files or this local knowledge graph loader. The original implementation is kept
+below for reference but commented out.
+"""
+
+raise RuntimeError("kg_r1.search.knowledge_graph is legacy and disabled in kgqa_agent mode")
+
+'''
 import os
 import json
 from typing import Dict, List, Optional, Any, Union
@@ -260,3 +270,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+'''

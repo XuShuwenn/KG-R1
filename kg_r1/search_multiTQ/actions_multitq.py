@@ -4,6 +4,13 @@ Action handlers for MultiTQ Knowledge Graph Retrieval.
 Adapted for temporal reasoning with MultiTQ's split-wise KG structure.
 """
 
+# NOTE(kgqa_agent mode): SPARQL-bridge training does not use the legacy MultiTQ
+# RoG-subgraph FastAPI retrieval stack. Preserve the implementation below for
+# reference, but comment it out.
+raise RuntimeError("kg_r1.search_multiTQ.actions_multitq is legacy and disabled in kgqa_agent mode")
+
+'''
+
 import json
 import time
 import uuid
@@ -429,3 +436,5 @@ ACTION_REGISTRY_MULTITQ = {
     ActionType.GET_TAIL_ENTITIES: GetTailEntitiesAction
     # Removed: GET_TEMPORAL_FACTS and GET_ENTITY_TIMELINE as requested
 }
+
+'''

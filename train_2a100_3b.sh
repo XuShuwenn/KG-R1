@@ -34,12 +34,12 @@ python -m verl.trainer.main_ppo \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
-    trainer.total_training_steps=100 \
+    trainer.total_training_steps=200 \
     trainer.total_epochs=1 \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
     trainer.resume_mode=disable \
     trainer.rollout_data_dir=rollout_trajectories/$ROLLOUT_DIR \
-    trainer.save_freq=20 \
+    trainer.save_freq=40 \
     trainer.test_freq=200 \
     trainer.logger='["wandb"]' \
     data.train_files=$DATA_DIR/cwq_kgqa_agent_format/train.parquet \
@@ -76,6 +76,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
     actor_rollout_ref.rollout.n=1 \
     +actor_rollout_ref.rollout.grpo_rollout_n=8 \
+    '+actor_rollout_ref.rollout.stop=["</kg-query>","</answer>"]' \
     actor_rollout_ref.rollout.search.enable=true \
     actor_rollout_ref.rollout.search.enable_during_training=true \
     actor_rollout_ref.rollout.search.enable_during_validation=true \
@@ -94,7 +95,7 @@ python -m verl.trainer.main_ppo \
     reward_model.reward_manager=kg_format_multiturn \
     +reward_model.reward_kwargs.turn_kg_query_validity=0.0 \
     +reward_model.reward_kwargs.turn_is_answer_score=0.0 \
-    +reward_model.reward_kwargs.turn_format_score=0.0 \
+    +reward_model.reward_kwargs.turn_format_score=0.5 \
     +reward_model.reward_kwargs.global_exact_match=1.0 \
     +reward_model.reward_kwargs.global_retrieval_quality=0.5 \
     +reward_model.reward_kwargs.verbose=true \

@@ -10,25 +10,11 @@ from verl import DataProto
 from verl.utils.tracking import Tracking
 import shutil
 import requests
-import json # Added for parsing JSON queries and formatting fallback
+import json
 from functools import lru_cache
 from kg_r1.search.error_types import KGErrorType
 from kg_r1.kgqa_bridge import KGQASparqlAdapter
-
-# Import prompt utilities for continuation and force-answer prompts
-try:
-    from verl.trainer.ppo.prompts import build_continuation_prompt, FORCE_ANSWER_PROMPT
-except ImportError:
-    # Fallback to kgqa_agent prompts if verl is not available
-    try:
-        from kgqa_agent.prompts.prompts import build_continuation_prompt, FORCE_ANSWER_PROMPT
-    except ImportError:
-        # Define fallback functions if both imports fail
-        def build_continuation_prompt(query_results: str) -> str:
-            return f'<information>Here are the query results:\n{query_results}\n</information>\n\nReview the results. If the answer is found, provide it in <answer> tags. Otherwise, continue reasoning in <think> tags and issue your next <kg-query>.\n\nReminder: After `get_relations`, you must rank all returned relations and call `get_triples` with the full ranked list. We will execute a query for the top 4.'
-        FORCE_ANSWER_PROMPT = """You have reached the maximum number of queries. Based on the information gathered, provide your final answer in <answer> tags.
-Strict Format: <answer>["Answer1", "Answer2"]</answer>. The answer(s) must be concise entity names copied exactly from the KG results.
-"""
+from verl.trainer.ppo.prompts import build_continuation_prompt, FORCE_ANSWER_PROMPT
 
 @dataclass
 class GenerationConfig:
@@ -40,8 +26,8 @@ class GenerationConfig:
     num_gpus: int
     no_think_rl: bool=False
     search_url: str = None
-    topk: int = 3 # Note: topk is not directly used by the KG server's current actions
-    # NEW: Dataset-specific server URLs (optional, fallback to environment variables or defaults)
+    topk: int = 3  # Legacy HTTP server config; SPARQL bridge may ignore.
+    # Optional dataset-specific server URLs (FastAPI/HTTP mode only)
     simpleqa_server_url: str = None  # Default: FB2M server on port 9001
     cwq_server_url: str = None 
     webqsp_server_url: str = None
@@ -51,9 +37,9 @@ class GenerationConfig:
     kgqa_relation_filter_model: str = None
     kgqa_max_calls: int = None
     kgqa_top_k: int = None
-    kgqa_timeout: int = 15  # Timeout for SPARQL queries (seconds)
+    kgqa_timeout: int = 15  # SPARQL timeout (seconds)
     kgqa_thread_pool_size: int = 40  # Max workers for per-turn SPARQL parallelism
-    kgqa_thread_timeout: Optional[float] = None  # Optional timeout per query future
+    kgqa_thread_timeout: Optional[float] = None  # Optional timeout per future
 
 class LLMGenerationManager:
     def __init__(
@@ -64,8 +50,7 @@ class LLMGenerationManager:
         is_validation: bool = False,
     ):
         self.tokenizer = tokenizer
-        
-        # Handle tokenizer-specific configurations
+
         self._setup_tokenizer_compatibility()
         
         self.actor_rollout_wg = actor_rollout_wg
@@ -76,13 +61,12 @@ class LLMGenerationManager:
             1, int(getattr(config, "kgqa_thread_pool_size", 40) or 40)
         )
         self.kgqa_thread_timeout = getattr(config, "kgqa_thread_timeout", None)
-        # Store kgqa_timeout for fallback when thread_timeout is None
+        # Fallback timeout for error messages / defaults.
         self.kgqa_timeout = getattr(config, "kgqa_timeout", 15) or 15
         self.kgqa_adapter: KGQASparqlAdapter | None = None
         if self.use_sparql_bridge:
             adapter_endpoint = config.sparql_endpoint or config.search_url
-            if not adapter_endpoint:
-                raise ValueError("SPARQL bridge enabled but no sparql_endpoint/search_url provided.")
+
             adapter_top_k = config.kgqa_top_k or config.topk
             adapter_max_calls = config.kgqa_max_calls or 10  # Default to 10 if not specified
             adapter_filter_model = config.kgqa_relation_filter_model
@@ -102,7 +86,7 @@ class LLMGenerationManager:
                 f"(max_calls={adapter_max_calls}, timeout={adapter_timeout}s, relation_filter_model={filter_msg})"
             )
         
-        # Track if we've already logged routing for each dataset
+        # Used only by legacy FastAPI routing.
         self._routing_logged = set()
 
         self.tensor_fn = TensorHelper(TensorConfig(
@@ -112,46 +96,107 @@ class LLMGenerationManager:
             max_start_length=config.max_start_length
         ))
         
-        # Pre-compile regex patterns for optimization
+        # Regex patterns used by parsing/postprocess.
         self._init_regex_patterns()
-        
-        # Initialize server routing configuration (only for FastAPI mode, not for SPARQL bridge)
+
+        # Legacy FastAPI routing (disabled in bridge mode).
         if not self.use_sparql_bridge:
             self._init_server_routing()
+        
+        # Cache chat template components for multi-turn conversations
+        self._init_chat_template_cache()
+    
+    def _init_chat_template_cache(self):
+        """
+        Initialize cached chat template components as token IDs for efficient multi-turn conversation formatting.
+        Pre-tokenizing special tokens avoids string-level concatenation errors.
+        """
+        if not hasattr(self.tokenizer, 'apply_chat_template') or self.tokenizer.chat_template is None:
+            print("[WARNING] Tokenizer does not support chat_template, multi-turn formatting disabled")
+            self._user_prefix_ids = None
+            self._user_suffix_ids = None
+            return
+        
+        try:
+            # Build a reusable user-turn wrapper from the tokenizer's chat template.
+            template_text = self.tokenizer.apply_chat_template(
+                [
+                    {"role": "assistant", "content": "Previous response"},
+                    {"role": "user", "content": "{{CONTENT}}"}
+                ],
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            # Extract prefix and suffix by splitting on placeholder
+            if "{{CONTENT}}" in template_text:
+                parts = template_text.split("{{CONTENT}}")
+                prefix_full = parts[0]
+                suffix = parts[1] if len(parts) > 1 else ""
+                
+                # Remove the previous assistant segment; keep only the user turn wrapper.
+                user_markers = ["<|im_start|>user", "<|start_header_id|>user", "[INST]", "<|user|>"]
+                prefix = prefix_full
+                for marker in user_markers:
+                    if marker in prefix_full:
+                        user_start = prefix_full.rfind(marker)
+                        prefix = prefix_full[user_start:]
+                        break
+                
+                # ===== OPTION 3 FIX: Pre-tokenize special tokens as token IDs =====
+                # Tokenize prefix and suffix separately to preserve special token integrity
+                if prefix:
+                    prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=False)
+                    self._user_prefix_ids = torch.tensor(prefix_ids, dtype=torch.long)
+                else:
+                    self._user_prefix_ids = torch.tensor([], dtype=torch.long)
+                
+                if suffix:
+                    suffix_ids = self.tokenizer.encode(suffix, add_special_tokens=False)
+                    self._user_suffix_ids = torch.tensor(suffix_ids, dtype=torch.long)
+                else:
+                    self._user_suffix_ids = torch.tensor([], dtype=torch.long)
+                # ===== END OPTION 3 FIX =====
+                
+                print(f"[CHAT_TEMPLATE] Initialized multi-turn template as token IDs:")
+                print(f"  Prefix: {repr(prefix[:80])} -> {self._user_prefix_ids.shape[0]} tokens")
+                print(f"  Suffix: {repr(suffix[:80])} -> {self._user_suffix_ids.shape[0]} tokens")
+            else:
+                print("[WARNING] Could not parse chat template, using fallback")
+                self._user_prefix_ids = None
+                self._user_suffix_ids = None
+            
+        except Exception as e:
+            print(f"[WARNING] Failed to initialize chat template cache: {e}")
+            import traceback
+            traceback.print_exc()
+            self._user_prefix_ids = None
+            self._user_suffix_ids = None
 
     def _setup_tokenizer_compatibility(self):
         """
         Setup tokenizer compatibility for different model families.
         Handles Llama2, Llama3, and Qwen2.5 tokenizers.
         """
-        # Get tokenizer class name and model name if available
         tokenizer_class = self.tokenizer.__class__.__name__
         model_name_or_path = getattr(self.tokenizer, 'name_or_path', '')
-        
-        # Detect tokenizer type based on class name (primary) and model path (secondary)
-        # Priority: tokenizer_class > model_name_or_path
-        # Note: model_name_or_path may contain "LLaMA-Factory" in the path, so we check tokenizer_class first
+
+        # Detect tokenizer family based on class name first.
         is_llama = False
         is_qwen = False
         
-        # Check tokenizer class first (most reliable indicator)
         tokenizer_class_lower = tokenizer_class.lower()
         model_path_lower = model_name_or_path.lower()
         
-        # Check for Llama tokenizers (Llama2 or Llama3)
-        # Only check model path if tokenizer class doesn't clearly indicate the type
+        # Prefer tokenizer class; fall back to model path when needed.
         if 'llama' in tokenizer_class_lower:
             is_llama = True
             print(f"[TOKENIZER] Detected Llama tokenizer: {tokenizer_class} (model: {model_name_or_path})")
-        # Check for Qwen tokenizers
         elif 'qwen' in tokenizer_class_lower:
             is_qwen = True
             print(f"[TOKENIZER] Detected Qwen tokenizer: {tokenizer_class} (model: {model_name_or_path})")
-        # Fallback: check model path if tokenizer class doesn't match
-        # But be careful: model path may contain "LLaMA-Factory" which is not the model type
         elif 'llama' in model_path_lower and 'qwen' not in model_path_lower:
-            # Only treat as Llama if path contains "llama" but NOT "qwen"
-            # Extract just the model name part (last component of path) to avoid false positives
+            # Avoid false positives from wrapper repos (e.g. "LLaMA-Factory").
             model_name = model_path_lower.split('/')[-1] if '/' in model_path_lower else model_path_lower
             if 'llama' in model_name:
                 is_llama = True
@@ -163,89 +208,26 @@ class LLMGenerationManager:
             is_qwen = True
             print(f"[TOKENIZER] Detected Qwen tokenizer (from model path): {tokenizer_class} (model: {model_name_or_path})")
         else:
-            # Raise error for unsupported tokenizers
             raise ValueError(
                 f"Unsupported tokenizer: {tokenizer_class} (model: {model_name_or_path}). "
                 f"Only Llama2, Llama3, and Qwen2.5 tokenizers are supported."
             )
         
-        # Handle Llama-specific setup
         if is_llama:
-            # Llama tokenizers don't have a pad_token by default
+            # Llama tokenizers often have no pad token.
             if self.tokenizer.pad_token is None:
                 print("[TOKENIZER] Llama tokenizer has no pad_token, setting pad_token = eos_token")
                 self.tokenizer.pad_token = self.tokenizer.eos_token
                 self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
             else:
                 print(f"[TOKENIZER] Llama tokenizer already has pad_token: {repr(self.tokenizer.pad_token)}")
-        
-        # Qwen tokenizers already have proper pad_token setup, no changes needed
+
         elif is_qwen:
             print(f"[TOKENIZER] Qwen tokenizer pad_token: {repr(self.tokenizer.pad_token)} (id: {self.tokenizer.pad_token_id})")
-            # No modifications needed for Qwen - preserve existing behavior
-        
-        # Verify pad_token is now set
+
         if self.tokenizer.pad_token_id is None:
             raise ValueError(f"Failed to set pad_token_id for {tokenizer_class}")
-
-    def _init_server_routing(self):
-        """Initialize server URL routing configuration for different datasets."""
-        # Priority: Config > Environment Variables > Defaults
-        self.server_routing = {
-            "simpleqa": os.environ.get("SIMPLEQA_SERVER_URL", "http://127.0.0.1:9001/retrieve"),
-            "cwq": os.environ.get("CWQ_SERVER_URL", "http://127.0.0.1:8001/retrieve"),
-            "webqsp": os.environ.get("WEBQSP_SERVER_URL", "http://127.0.0.1:8001/retrieve"),
-            "multitq": os.environ.get("MULTITQ_SERVER_URL", "http://127.0.0.1:8001/retrieve"),
-            "metaqa": os.environ.get("METAQA_SERVER_URL", "http://127.0.0.1:9002/retrieve"),
-            "grailqa": os.environ.get("GRAILQA_SERVER_URL", "http://127.0.0.1:9000/retrieve"),
-            "trex": os.environ.get("TREX_SERVER_URL", "http://127.0.0.1:9011/retrieve"),
-            "qald10en": os.environ.get("QALD10EN_SERVER_URL", "http://127.0.0.1:9010/retrieve"),
-            "zero_shot_re": os.environ.get("ZERO_SHOT_RE_SERVER_URL", "http://127.0.0.1:9012/retrieve"),
-        }
         
-        # Fallback server URL (original behavior)
-        self.fallback_server_url = self.config.search_url or "http://127.0.0.1:8001/retrieve"
-        
-        print(f"[KG_ROUTING] Server routing configuration:")
-        for dataset, url in self.server_routing.items():
-            print(f"  {dataset} -> {url}")
-        print(f"  fallback -> {self.fallback_server_url}")
-
-    def _get_server_url_for_dataset(self, dataset_name: str) -> str:
-        """
-        Get the appropriate server URL for a given dataset.
-        
-        Args:
-            dataset_name: Name of the dataset (simpleqa, cwq, webqsp, etc.)
-            
-        Returns:
-            Server URL for the dataset
-        """
-        # This method should only be called in FastAPI mode (not SPARQL bridge mode)
-        if not hasattr(self, 'server_routing') or not hasattr(self, 'fallback_server_url'):
-            raise RuntimeError(
-                "Server routing not initialized. This method should only be called in FastAPI mode, "
-                "not in SPARQL bridge mode."
-            )
-        
-        if not dataset_name:
-            return self.fallback_server_url
-            
-        # Normalize dataset name to lowercase
-        dataset_key = dataset_name.lower().strip()
-        
-        # Return specific server URL or fallback
-        server_url = self.server_routing.get(dataset_key, self.fallback_server_url)
-        
-        # Log routing decision for debugging (only once per dataset)
-        if dataset_key not in self._routing_logged:
-            self._routing_logged.add(dataset_key)
-            if dataset_key in self.server_routing:
-                print(f"[KG_ROUTING] {dataset_name} -> {server_url}")
-            else:
-                print(f"[KG_ROUTING] Unknown dataset '{dataset_name}', using fallback -> {server_url}")
-            
-        return server_url
 
     def _build_bridge_session_keys(self, meta_info: Dict[str, Any] | None, count: int) -> List[str]:
         """Ensure per-example session keys for kgqa adapter."""
@@ -317,7 +299,6 @@ class LLMGenerationManager:
             skip_special_tokens=True
         )
 
-
         def clean_response(resp: str) -> str:
             # First, remove any conversation markers if present
             if '<|im_start|>assistant' in resp:
@@ -328,6 +309,14 @@ class LLMGenerationManager:
                         resp = resp[assistant_idx + after_assistant + 1:]
                     else:
                         resp = resp[assistant_idx + len('<|im_start|>assistant'):]
+            
+            # ===== FIX #2: Repair truncated closing tags (align with evaluation endpoint) =====
+            # If opening tag exists but closing tag is missing, likely truncated by max_tokens
+            if '<kg-query>' in resp and '</kg-query>' not in resp:
+                resp += '</kg-query>'
+            if '<answer>' in resp and '</answer>' not in resp:
+                resp += '</answer>'
+            # ===== END FIX #2 =====
             
             # --- MODIFIED LOGIC START ---
 
@@ -365,41 +354,121 @@ class LLMGenerationManager:
         return responses, responses_str
 
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
-        """Process next observations from environment."""
+        """Process next observations from environment with proper chat template formatting.
         
-        next_obs_ids = self.tokenizer(
-            next_obs, 
-            padding='longest',
-            return_tensors='pt',
-            add_special_tokens=False,  # Prevents adding special tokens
-        )['input_ids']
+        Uses pre-tokenized special tokens (Option 3) to avoid string-level concatenation errors.
+        """
+        
+        # ===== OPTION 3 FIX: Token-ID level concatenation =====
+        if self._user_prefix_ids is not None and self._user_suffix_ids is not None:
+            # Tokenize observation content only (without special tokens)
+            obs_content_ids = self.tokenizer(
+                next_obs, 
+                padding='longest',
+                return_tensors='pt',
+                add_special_tokens=False
+            )['input_ids']
+            
+            batch_size = obs_content_ids.shape[0]
+            device = obs_content_ids.device
+            
+            # Expand prefix and suffix to batch size
+            prefix_ids = self._user_prefix_ids.unsqueeze(0).expand(batch_size, -1).to(device)
+            suffix_ids = self._user_suffix_ids.unsqueeze(0).expand(batch_size, -1).to(device)
+            
+            # Concatenate at token-ID level: [prefix] + [content] + [suffix]
+            next_obs_ids = torch.cat([prefix_ids, obs_content_ids, suffix_ids], dim=1)
+        else:
+            # Fallback: no template formatting (backward compatibility)
+            next_obs_ids = self.tokenizer(
+                next_obs, 
+                padding='longest',
+                return_tensors='pt',
+                add_special_tokens=False
+            )['input_ids']
+        # ===== END OPTION 3 FIX =====
 
+        # Apply max_obs_length truncation
         if next_obs_ids.shape[1] > self.config.max_obs_length:
-            next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
+            # Truncate from the middle (preserve prefix/suffix if present)
+            if self._user_prefix_ids is not None and self._user_suffix_ids is not None:
+                prefix_len = self._user_prefix_ids.shape[0]
+                suffix_len = self._user_suffix_ids.shape[0]
+                available_content_len = self.config.max_obs_length - prefix_len - suffix_len
+                
+                if available_content_len > 0:
+                    # Keep prefix + truncated content + suffix
+                    truncated_content = next_obs_ids[:, prefix_len:prefix_len + available_content_len]
+                    suffix_start = next_obs_ids.shape[1] - suffix_len
+                    next_obs_ids = torch.cat([
+                        next_obs_ids[:, :prefix_len],
+                        truncated_content,
+                        next_obs_ids[:, suffix_start:]
+                    ], dim=1)
+                else:
+                    # Fallback: just truncate naively
+                    next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
+            else:
+                next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
 
-        # --- Added safeguard to preserve closing </information> tag after truncation ---
-        # Decode each truncated observation string and ensure that any <information> block
-        # still ends with a proper closing tag. If the tag is missing (likely due to
-        # truncation) we append an ellipsis and the closing tag to avoid malformed
-        # markup that confuses the LLM.
+        # ===== FIX #4: Enhanced safeguard for truncation =====
+        # Preserve closing tags AND verify special tokens are intact
         obs_fixed = []
         needs_fix = False
         for obs_ids in next_obs_ids:
-            text = self.tokenizer.decode(obs_ids, skip_special_tokens=True)
+            text = self.tokenizer.decode(obs_ids, skip_special_tokens=False)  # Keep special tokens for check
+            
+            # Check 1: Preserve closing </information> tag
             if "<information>" in text and "</information>" not in text:
                 needs_fix = True
-                obs_fixed.append(text.rstrip() + " …</information>")
-            else:
-                obs_fixed.append(text)
+                text = text.rstrip() + " …</information>"
+            
+            # Check 2: Verify special tokens are not corrupted (e.g., <|im_start|> split into <|im_sta)
+            if self._user_prefix_ids is not None and self._user_suffix_ids is not None:
+                # Decode expected prefix/suffix to check integrity
+                expected_prefix = self.tokenizer.decode(self._user_prefix_ids, skip_special_tokens=False)
+                expected_suffix = self.tokenizer.decode(self._user_suffix_ids, skip_special_tokens=False)
+                
+                # Check if truncation corrupted special tokens
+                # Look for partial matches that indicate corruption
+                special_markers = ['<|im_start|>', '<|im_end|>', '<|start_header_id|>', '<|end_header_id|>']
+                for marker in special_markers:
+                    if marker in expected_prefix or marker in expected_suffix:
+                        # Check for partial marker (e.g., '<|im_sta' without closing '>')
+                        for i in range(3, len(marker)):  # Check substrings of length 3+
+                            partial = marker[:i]
+                            if partial in text and marker not in text:
+                                # Found corrupted marker, mark for fix
+                                needs_fix = True
+                                # Remove the corrupted partial marker
+                                text = text.replace(partial, '')
+                                break
+            
+            obs_fixed.append(text)
+        
         if needs_fix:
-            # Re-tokenize the fixed observations so shapes stay consistent
-            next_obs_ids = self.tokenizer(
-                obs_fixed,
-                padding='longest',
-                return_tensors='pt',
-                add_special_tokens=False,
-            )['input_ids']
-        # --- End safeguard ---
+            # Re-tokenize the fixed observations maintaining the same structure
+            if self._user_prefix_ids is not None and self._user_suffix_ids is not None:
+                # Need to re-apply the prefix/suffix wrapping
+                obs_content_ids_fixed = self.tokenizer(
+                    obs_fixed,
+                    padding='longest',
+                    return_tensors='pt',
+                    add_special_tokens=False,
+                )['input_ids']
+                batch_size = obs_content_ids_fixed.shape[0]
+                device = obs_content_ids_fixed.device
+                prefix_ids = self._user_prefix_ids.unsqueeze(0).expand(batch_size, -1).to(device)
+                suffix_ids = self._user_suffix_ids.unsqueeze(0).expand(batch_size, -1).to(device)
+                next_obs_ids = torch.cat([prefix_ids, obs_content_ids_fixed, suffix_ids], dim=1)
+            else:
+                next_obs_ids = self.tokenizer(
+                    obs_fixed,
+                    padding='longest',
+                    return_tensors='pt',
+                    add_special_tokens=False,
+                )['input_ids']
+        # ===== END FIX #4 =====
 
         return next_obs_ids
 
@@ -637,7 +706,7 @@ class LLMGenerationManager:
                 sample_data_source = str(dataset_names[i])
             
             interaction_history.append({
-                "data_source": sample_data_source,  # ADD: Include dataset info for reward calculation
+                "data_source": sample_data_source,  
                 "actions": [],
                 "search_results": [],
                 "valid_actions": [],
@@ -742,6 +811,24 @@ class LLMGenerationManager:
         if active_mask.sum():
             active_count = active_mask.sum().item()
             print(f"[DEBUG-GENERATION] Final turn after {self.config.max_turns} turns: {active_count}/{actual_batch_size} samples still active, forcing answer...")
+            
+            # Inject FORCE_ANSWER_PROMPT for all still-active samples before final generation
+            # This explicitly tells the model to provide an answer now
+            force_answer_obs = []
+            for i in range(actual_batch_size):
+                if active_mask[i]:
+                    force_answer_obs.append(f"\n\n{FORCE_ANSWER_PROMPT}")
+                else:
+                    force_answer_obs.append("")  # Inactive samples get empty string
+            
+            # Process FORCE_ANSWER_PROMPT as observation and update rolling state
+            force_answer_obs_ids = self._process_next_obs(force_answer_obs)
+            rollings = self._update_rolling_state(
+                rollings,
+                torch.zeros((actual_batch_size, 0), dtype=torch.long, device=rollings.batch['input_ids'].device),  # Empty responses
+                force_answer_obs_ids
+            )
+            # No need to update right_side since this is just an observation, not a model response
             
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
@@ -1021,8 +1108,6 @@ class LLMGenerationManager:
                     is_search.append(0)
                     raw_server_responses.append({})
                 elif action == 'kg-query':
-                    # Reset consecutive format errors on successful action
-                    consecutive_format_errors[i] = 0
                     # CRITICAL FIX: Use the mapping to get the correct response for this sample
                     if i in kg_response_map:
                         kg_result, raw_kg_response = kg_response_map[i]
@@ -1034,25 +1119,43 @@ class LLMGenerationManager:
                             raw_kg_response.get("meta", {}).get("action") == "max_calls_reached"
                         )
                         
+                        # Check if query was successful (only wrap successful results with continuation_prompt)
+                        is_query_successful = (
+                            isinstance(raw_kg_response, dict) and
+                            raw_kg_response.get("success", True) and
+                            raw_kg_response.get("kg_metadata", {}).get("success", True)
+                        )
+                        
                         if is_max_calls_reached:
                             # Max calls reached: use FORCE_ANSWER_PROMPT to force model to answer
+                            # Reset consecutive errors since max_calls is a system constraint, not model error
+                            consecutive_format_errors[i] = 0
                             # Build continuation prompt with the last query results (includes <information> tags)
                             continuation = build_continuation_prompt(kg_result.strip())
                             # Append FORCE_ANSWER_PROMPT after continuation to force answer
                             # Note: continuation already includes <information> and guidance text
-                            # Add <think> tag after user message to guide model thinking
-                            next_obs.append(f'\n\n{continuation}\n\n{FORCE_ANSWER_PROMPT}\n<think>')
+                            next_obs.append(f'\n\n{continuation}\n\n{FORCE_ANSWER_PROMPT}')
                             raw_server_responses.append(raw_kg_response)
                             dones.append(1)  # Force done to end conversation after model answers
                             valid_action.append(1)  # The query itself was valid
                             is_search.append(1)
+                        elif not is_query_successful:
+                            # Query failed/error: increment error count (entity error, relation error, parse error)
+                            consecutive_format_errors[i] += 1
+                            # Return error message directly without continuation_prompt wrapper
+                            # This allows model to see the raw error message
+                            next_obs.append(f'\n\n<information>{kg_result.strip()}</information>')
+                            raw_server_responses.append(raw_kg_response)
+                            dones.append(0)  # Continue conversation to allow retry
+                            valid_action.append(0)  # Mark as invalid action due to error
+                            is_search.append(1)
                         else:
-                            # Normal query: continue conversation using CONTINUATION_PROMPT_TEMPLATE
+                            # Normal successful query: reset error count and wrap with continuation_prompt
+                            consecutive_format_errors[i] = 0
                             # This includes <information> tags and guidance text
                             continuation = build_continuation_prompt(kg_result.strip())
                             # The continuation prompt already includes <information> and guidance text
-                            # Add <think> tag at the end to guide model thinking
-                            next_obs.append(f'\n\n{continuation}\n<think>')
+                            next_obs.append(f'\n\n{continuation}')
                             raw_server_responses.append(raw_kg_response)
                             dones.append(0)  # Continue conversation
                             # Fix: KG queries are invalid if search is disabled (final turn)
@@ -1062,9 +1165,9 @@ class LLMGenerationManager:
                                 valid_action.append(0)  # Invalid in final turn when search is disabled
                             is_search.append(1)
                     else:
-                        # Fallback if something went wrong
-                        # Add <think> tag after error message to guide model thinking
-                        next_obs.append(f'\n\n<information>Error: No response found for this query</information>\n\n<think>')
+                        # Fallback if something went wrong (query not in mapping)
+                        consecutive_format_errors[i] += 1
+                        next_obs.append(f'\n\n<information>Error: No response found for this query</information>')
                         raw_server_responses.append({"error": "No response mapped"})
                         dones.append(0)
                         valid_action.append(0)
@@ -1077,23 +1180,22 @@ class LLMGenerationManager:
                     
                     # Check if this is a length-exceeded response
                     if response_length_exceeded[i]:
-                        # Add <think> tag after information to guide model thinking
-                        next_obs.append(f'\n\n<information>Your previous response was too long ({contents[i]}). Please provide shorter responses within the token limit.</information>\n<think>')
+                        next_obs.append(f'\n\n<information>Your previous response was too long ({contents[i]}). Please provide shorter responses within the token limit.</information>')
                     elif consecutive_format_errors[i] >= 3:
                         # After 3 consecutive format errors, provide critical guidance (aligned with eval side)
                         # Note: eval side retries 3 times then continues, we provide stronger guidance
                         next_obs.append(
                             f'\n\n<information>CRITICAL: You have made {consecutive_format_errors[i]} '
-                            f'consecutive format errors. You MUST output EITHER:\n'
+                            f'format errors. You MUST output EITHER:\n'
                             f'1. <kg-query>get_relations("entity")</kg-query> to search the knowledge graph, OR\n'
                             f'2. <answer>["Entity1", "Entity2"]</answer> to provide your final answer.\n'
-                            f'No other format is accepted. Follow the exact tag format shown above.</information>\n<think>'
+                            f'No other format is accepted. Follow the exact tag format shown above.</information>'
                         )
                         # Continue allowing the model to retry (don't force termination yet)
                         # This gives the model one more chance with stronger guidance
                     else:
-                        # Add <think> tag after information to guide model thinking
-                        next_obs.append(f'\n\n<information>Your previous action is invalid. You should put the query between <kg-query> and </kg-query> if you want to search, or put the answer between <answer> and </answer> if you want to give the final answer.</information>\n<think>')
+                        # Align with eval side error message
+                        next_obs.append(f'\n\n<information>Your response did not contain a valid <kg-query> or <answer> tag. Please continue by outputting a valid <kg-query> or <answer>.</information>')
                     dones.append(0)
                     valid_action.append(0)
                     is_search.append(0)
@@ -1171,17 +1273,19 @@ class LLMGenerationManager:
                 # Determine action based on actual tag order
                 candidates: List[Tuple[str, int, str]] = []
 
-                # Use findall to get all matches, then take the last one to align with eval side
+                # Use findall to get all matches, then take the last VALID one (must be bracketed list)
                 answer_matches = self.answer_pattern.findall(prediction)
                 if answer_matches:
-                    # Take the last match and find its position
-                    last_answer_content = answer_matches[-1].strip()
-                    # Find the position of the last match
-                    last_match = None
+                    # Filter matches: only accept <answer>[...]</answer> (bracketed list)
+                    valid_answer_match = None
                     for match in self.answer_pattern.finditer(prediction):
-                        last_match = match
-                    if last_match:
-                        candidates.append(("answer", last_match.start(), last_answer_content))
+                        content = match.group(1).strip()
+                        if content.startswith("[") and content.endswith("]"):
+                            valid_answer_match = match  # Keep updating to get the last valid one
+                    
+                    if valid_answer_match:
+                        last_answer_content = valid_answer_match.group(1).strip()
+                        candidates.append(("answer", valid_answer_match.start(), last_answer_content))
 
                 # For kg-query, also take the last match to be consistent
                 kg_query_matches = self.kg_query_pattern1.findall(prediction)
@@ -1263,7 +1367,7 @@ class LLMGenerationManager:
                 )
                 print(f"[DEBUG-KG-SEARCH] batch_search: SPARQL bridge completed, got {len(kg_results)} results")
             else:
-                kg_server_responses, kg_results = self._batch_search(valid_queries, valid_meta_infos) # Pass list of meta_infos
+                raise RuntimeError("Legacy HTTP KG retrieval is disabled in kgqa_agent mode")
             
             # Merge error messages and valid results in correct order
             final_results = []
@@ -1292,7 +1396,6 @@ class LLMGenerationManager:
                 })
             return results, error_responses
 
-    def _batch_search(self, search_query_contents: List[str], meta_info_list) -> Tuple[List[Dict[str, Any]], List[str]]:
         """
         Sends a batch of requests to the KG retrieval server.
         Args:
@@ -1300,6 +1403,12 @@ class LLMGenerationManager:
             meta_info_list: List of meta_info dicts, one per query.
         Returns:
             A tuple of (raw_server_responses, formatted_string_responses) from the KG server.
+        """
+        # NOTE(kgqa_agent mode): This entire method is legacy (KG-R1 FastAPI HTTP KG
+        # retrieval server client). It is never used when `use_sparql_bridge=True`.
+        #
+        # The original implementation is preserved below, but commented out.
+        raise RuntimeError("Legacy HTTP KG retrieval is disabled in kgqa_agent mode")
         """
         parsed_requests = []
 
@@ -1543,6 +1652,8 @@ class LLMGenerationManager:
         
         return final_responses, formatted_responses
 
+        """
+
     def _batch_search_via_sparql_bridge(
         self,
         search_query_contents: List[str],
@@ -1638,9 +1749,7 @@ class LLMGenerationManager:
             payload["request_payload"].setdefault("query_index", idx)
             return idx, payload, formatted
 
-        # Remove timeout on future.result() to allow successful queries to complete
-        # SPARQLWrapper's internal timeout (15s per query) will still prevent individual queries from hanging
-        # This allows get_triples with multiple relations to complete even if total time exceeds 15s
+        # No per-future timeout: rely on the adapter/SPARQL client timeout.
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
                 executor.submit(_run_single, idx): idx for idx in range(query_count)
@@ -1648,7 +1757,6 @@ class LLMGenerationManager:
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
                 try:
-                    # No timeout - allow successful queries to complete regardless of duration
                     result_idx, payload, formatted = future.result()
                 except Exception as exc:
                     meta_info = meta_info_list[idx] if idx < len(meta_info_list) else {}
@@ -1671,96 +1779,21 @@ class LLMGenerationManager:
 
         return raw_payloads, formatted_results  # type: ignore
 
-    def _passages2string(self, kg_server_response_item: Dict[str, Any]) -> str:
-        """
-        Formats a single KG server response item into a string for the LLM.
-        Updated to handle the new kg_retrieval response format.
-        """
-        if not isinstance(kg_server_response_item, dict):
-            return f"Error: Unexpected KG server response format: {type(kg_server_response_item)}"
-
-        # Handle the new kg_retrieval format
-        if "object" in kg_server_response_item and kg_server_response_item.get("object") == "kg_retrieval":
-            # New format: kg_retrieval response
-            if not kg_server_response_item.get("success", False):
-                # Error case - return the error message directly without prefixing
-                if "choices" in kg_server_response_item and kg_server_response_item["choices"]:
-                    error_content = kg_server_response_item["choices"][0].get("message", {}).get("content", "Unknown error")
-                    return error_content
-                return "Unknown error occurred. Please check your search format."
-            
-            # Success case - extract content from choices
-            if "choices" in kg_server_response_item and kg_server_response_item["choices"]:
-                content = kg_server_response_item["choices"][0].get("message", {}).get("content", "No content")
-                return content
-            
-            return "No content in KG server response"
-        
-        # Handle old format for backward compatibility
-        if "error" in kg_server_response_item:
-            return kg_server_response_item['error']  # Return error message directly
-
-        action_actual_results = kg_server_response_item.get("results")
-        if not action_actual_results or not isinstance(action_actual_results, list) or len(action_actual_results) == 0:
-            # This case might also indicate an error handled by the server and put into the 'results' list.
-            # e.g. {"results": [{"error": "subgraph not found"}]}
-            if isinstance(action_actual_results, list) and len(action_actual_results) > 0 and "error" in action_actual_results[0]:
-                 return action_actual_results[0]['error']  # Return error message directly
-            return "No results found for your search query."
-
-        data_payload = action_actual_results[0] # The actual data is wrapped in a list
-
-        if "error" in data_payload: # Error specific to the KG operation for that item
-            return data_payload['error']  # Return error message directly
-
-        if "relations" in data_payload:
-            relations = data_payload['relations']
-            if relations:
-                return f"Found relations: {', '.join(relations)}."
-            else:
-                return "No relations found."
-        elif "head_entities" in data_payload:
-            head_entities = data_payload['head_entities']
-            if head_entities:
-                return f"Found head entities: {', '.join(head_entities)}."
-            else:
-                return "No head entities found."
-        elif "tail_entities" in data_payload:
-            tail_entities = data_payload['tail_entities']
-            if tail_entities:
-                return f"Found tail entities: {', '.join(tail_entities)}."
-            else:
-                return "No tail entities found."
-        else:
-            return f"Retrieved data: {json.dumps(data_payload)}" # Fallback for other structures
-
-    def _get_available_actions_from_server(self) -> List[str]:
-        """Get available actions from the server endpoint."""
-        try:
-            response = requests.get(f"{self.config.search_url.rstrip('/retrieve')}/actions")
-            if response.status_code == 200:
-                return response.json().get("actions", [])
-        except Exception:
-            pass
-        # Fallback to default actions (new naming scheme)
-        return ["get_relations_in", "get_relations_out", "get_entities_in", "get_entities_out"]
 
     def _create_query_format_error(self, query_content: str, original_error: str) -> str:
-        """Create an LLM-friendly error message for query format issues."""
+        """Create an LLM-friendly error message for query format issues (aligned with eval side)."""
         
         # For kgqa_agent mode (SPARQL bridge), use get_relations and get_triples
+        # Align with eval side error message format
         if self.use_sparql_bridge:
             return (
-                f"Invalid query format: '{query_content}'. "
-                f"Use function call format like: get_relations(\"entity\") or get_triples(\"entity\", [\"relation1\", \"relation2\"]). "
-                f"Available functions: get_relations(\"entity\"), get_triples(\"entity\", [\"relation1\", \"relation2\"]). "
+                f"Invalid query format. Use get_relations(\"entity_name\") "
+                f"or get_triples(\"entity_name\", [\"relation1\", ...])."
             )
-        
-        # For kg-r1 mode (FastAPI), get available actions dynamically from server
-        available_actions = self._get_available_actions_from_server()
-        functions_list = ", ".join(available_actions)
-        
-        return f"Query format error. Available functions: {functions_list}"
+
+        # NOTE(kgqa_agent mode): Legacy FastAPI routing and actions introspection
+        # are disabled, so we intentionally fail fast here.
+        raise RuntimeError("Legacy FastAPI query format errors are disabled in kgqa_agent mode")
 
     def _parse_kg_query(self, query_content_str: str) -> Dict[str, Any]:
         """
@@ -1909,8 +1942,6 @@ class LLMGenerationManager:
             error_msg = (
                 f"Invalid query format: '{query_content_str}'. "
                 f"Use function call format like: get_relations(\"entity\") or get_triples(\"entity\", [\"relation1\", \"relation2\"]). "
-                f"Available functions: get_relations(\"entity\"), get_triples(\"entity\", [\"relation1\", \"relation2\"]). "
-                f"Example: get_relations(\"Barack Obama\")"
             )
         else:
             # kg-r1 mode: use get_relations_in/get_relations_out/get_entities_in/get_entities_out
@@ -2053,97 +2084,3 @@ class LLMGenerationManager:
                     kg_query_idx += 1
         
         return kg_query_meta_infos
-
-    def _format_http_error(self, error: Exception, request_data: Dict = None) -> str:
-        """
-        Format HTTP transport errors into concise messages.
-        Note: Server-side errors are now handled by the KG server with detailed messages.
-        This only handles HTTP transport failures.
-        
-        Args:
-            error: The HTTP exception
-            request_data: The original request data (used for context in fallback cases)
-            
-        Returns:
-            Concise error message for HTTP transport failures
-        """
-        error_str = str(error).lower()
-        
-        # Extract entity name from request if available for fallback
-        entity_name = "query"
-        if request_data and "entity_id" in request_data:
-            entity_name = f"'{request_data['entity_id']}'"
-        
-        # For actual server errors that contain detailed error messages, try to extract them
-        if hasattr(error, 'response') and error.response is not None:
-            try:
-                # Try to get the detailed server error message
-                response_data = error.response.json()
-                
-                # Handle list response (batch requests)
-                if isinstance(response_data, list) and len(response_data) > 0:
-                    server_response = response_data[0]
-                else:
-                    server_response = response_data
-                
-                # Try multiple extraction strategies
-                detailed_error = None
-                
-                # Strategy 1: kg_retrieval format with choices
-                if ("choices" in server_response and 
-                    len(server_response["choices"]) > 0 and
-                    "message" in server_response["choices"][0] and
-                    "content" in server_response["choices"][0]["message"]):
-                    detailed_error = server_response["choices"][0]["message"]["content"]
-                
-                # Strategy 2: Direct error field
-                elif "error" in server_response:
-                    detailed_error = server_response["error"]
-                
-                # Strategy 3: Detail field (FastAPI validation errors)
-                elif "detail" in server_response:
-                    if isinstance(server_response["detail"], list) and len(server_response["detail"]) > 0:
-                        # FastAPI validation error format
-                        detail_item = server_response["detail"][0]
-                        if "msg" in detail_item:
-                            detailed_error = detail_item["msg"]
-                        else:
-                            detailed_error = str(server_response["detail"])
-                    else:
-                        detailed_error = str(server_response["detail"])
-                
-                # Strategy 4: Success=False format  
-                elif (server_response.get("success") is False and 
-                      "message" in server_response):
-                    detailed_error = server_response["message"]
-                
-                if detailed_error:
-                    return detailed_error
-                
-                # If we got a response but couldn't extract error, log it for debugging
-                
-            except (json.JSONDecodeError, KeyError, IndexError, AttributeError, TypeError) as parse_error:
-                print(f"[KG_PARSE_ERROR] Failed to parse server response: {parse_error}")
-                # Try to get raw response text for debugging
-                try:
-                    response_text = error.response.text[:200] if hasattr(error.response, 'text') else "No response text"
-                    print(f"[KG_RAW_RESPONSE] First 200 chars: {response_text}")
-                except:
-                    pass
-        
-        # Handle HTTP transport errors with simple, generic messages
-        if "timeout" in error_str or "timed out" in error_str:
-            return "KG server request timed out"
-        elif "connection" in error_str or "cannot connect" in error_str:
-            return "Cannot connect to KG server"
-        elif "404" in error_str or "not found" in error_str:
-            return "KG server endpoint not found"
-        elif "500" in error_str or "internal server error" in error_str:
-            return "KG server internal error"
-        elif "503" in error_str or "service unavailable" in error_str:
-            return "KG server unavailable"
-        else:
-            # Generic fallback for any other HTTP transport issues
-            return f"KG server request failed for {entity_name}"
-
-

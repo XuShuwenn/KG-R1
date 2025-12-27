@@ -23,8 +23,14 @@ class _DummyDirectClient:
         self._seen_relations_set = set()
         self._pending_flatten_relations = {}
 
-    def clear_pending_flatten_relations(self):
-        self._pending_flatten_relations = {}
+    def clear_pending_flatten_relations(self, entity_ids=None):
+        if entity_ids is None:
+            self._pending_flatten_relations = {}
+            return None
+        if isinstance(entity_ids, str):
+            entity_ids = [entity_ids]
+        for eid in entity_ids:
+            self._pending_flatten_relations.pop(eid, None)
         return None
 
     def _resolve_entity(self, entity: str) -> str:

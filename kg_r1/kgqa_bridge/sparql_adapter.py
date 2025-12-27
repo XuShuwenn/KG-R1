@@ -10,18 +10,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from kg_r1.search.error_types import KGErrorType
 
-try:
-    from kgqa_agent.src.tools.relation_normalizer import normalize_relation
-    from kgqa_agent.src.eval.model_client import BaseModelClient, ModelConfig
-    from kgqa_agent.prompts.filter_prompt import __doc__ as filter_prompt_template
-    from kgqa_agent.prompts.flatten_rel_filter_prompt import (
-        __doc__ as flatten_rel_filter_prompt_template,
-    )
-except ImportError as exc:  # pragma: no cover - import guard
-    raise ImportError(
-        "kgqa_agent package is required for KGQASparqlAdapter. "
-        "Ensure the repo submodule is available and on PYTHONPATH."
-    ) from exc
+from kgqa_agent.src.tools.relation_normalizer import normalize_relation
+from kgqa_agent.src.eval.model_client import BaseModelClient, ModelConfig
+from kgqa_agent.prompts.filter_prompt import __doc__ as filter_prompt_template
+from kgqa_agent.prompts.flatten_rel_filter_prompt import (
+    __doc__ as flatten_rel_filter_prompt_template,
+)
 
 
 @dataclass
@@ -79,6 +73,8 @@ class KGQASparqlAdapter:
         self._filter_fallback_count = 0
         self._filter_parse_fail_count = 0
         self._filter_last_log_time = 0.0
+
+        self._relation_filter_candidate_k = 50
 
     @staticmethod
     def _normalize_endpoint(sparql_endpoint: str) -> str:
@@ -152,15 +148,37 @@ class KGQASparqlAdapter:
 
     def reset(self, sample_id: Optional[str] = None) -> None:
         """Clear adapter state. If sample_id is None, reset all sessions."""
+        entity_ids_to_clear: List[str] = []
         with self._sessions_lock:
             if sample_id is None:
                 self._sessions.clear()
             else:
                 session = self._sessions.pop(sample_id, None)
+                if session is not None and session.entity_registry:
+                    # Collect entity IDs (MIDs) that were touched in this session.
+                    # entity_registry stores both name->id and id->name.
+                    for k, v in session.entity_registry.items():
+                        if isinstance(k, str) and k.startswith(("m.", "g.", "en.")):
+                            entity_ids_to_clear.append(k)
+                        if isinstance(v, str) and v.startswith(("m.", "g.", "en.")):
+                            entity_ids_to_clear.append(v)
                 # Query count is reset when session is removed
         if self._client:
             # Clear flatten relations cache between questions to mimic kgqa_agent behavior
-            self._client.clear_pending_flatten_relations()
+            if sample_id is None:
+                self._client.clear_pending_flatten_relations()
+            else:
+                # Only clear pending flatten relations for entities used by this sample.
+                # This avoids cross-sample interference when multiple samples share one adapter.
+                if entity_ids_to_clear:
+                    # Deduplicate while preserving order (small list)
+                    seen = set()
+                    deduped: List[str] = []
+                    for eid in entity_ids_to_clear:
+                        if eid not in seen:
+                            seen.add(eid)
+                            deduped.append(eid)
+                    self._client.clear_pending_flatten_relations(deduped)
         if sample_id is None:
             for session in self._sessions.values():
                 session.trace.clear()
@@ -195,7 +213,8 @@ class KGQASparqlAdapter:
         
         if not query_str:
             return self._format_error(
-                "Empty query string received. Use get_relations(entity) or get_triples(entity, [relations]).",
+                "Invalid query format. Use get_relations(\"entity_name\") "
+                "or get_triples(\"entity_name\", [\"relation1\", ...]).",
                 sample_id,
                 KGErrorType.FORMAT_ERROR,
             )
@@ -208,15 +227,7 @@ class KGQASparqlAdapter:
         
         # Check query count limit (mimicking kgqa_agent's max_calls behavior)
         if session.query_count >= self._max_calls:
-            try:
-                from verl.trainer.ppo.prompts import FORCE_ANSWER_PROMPT
-            except ImportError:
-                FORCE_ANSWER_PROMPT = (
-                    "You have reached the maximum number of queries. "
-                    "Based on the information gathered, provide your final answer in <answer> tags. "
-                    "Strict Format: <answer>[\"Answer1\", \"Answer2\"]</answer>. "
-                    "The answer(s) must be concise entity names copied exactly from the KG results."
-                )
+            from verl.trainer.ppo.prompts import FORCE_ANSWER_PROMPT
             
             self._logger.info(
                 f"Max calls ({self._max_calls}) reached for sample {sample_id}. "
@@ -342,7 +353,7 @@ class KGQASparqlAdapter:
             relations = self._client.get_relations(
                 entity_resolved,
                 question=augmented_question,  # Use augmented_question (aligning with kgqa_agent)
-                top_k=self._kg_top_k * 3,
+                top_k=self._relation_filter_candidate_k,
             )
             query_time = time.time() - query_start
             if query_time > 0.1:

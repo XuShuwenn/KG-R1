@@ -20,9 +20,8 @@ from .kg_format import KGFormatRewardManager
 from verl.utils.reward_score.qa_em_format_kg import normalize_answer, is_retrieval_correct_kg, extract_answer_kg, em_check_kg, extract_assistant_response
 from kg_r1.search.error_types import KGErrorType
 import json
-import re
 
-# Removed enhanced_metrics imports - using entity-level calculations only
+# Uses entity-level metrics only.
 
 
 class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
@@ -36,8 +35,8 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
     
     def __init__(self, tokenizer, num_examine, **reward_kwargs):
         super().__init__(tokenizer, num_examine, **reward_kwargs)
-        
-        # Multi-turn specific configuration
+
+        # Weights for per-turn and global components.
         self.turn_specific_weights = {
             'kg_query_validity': reward_kwargs.get('turn_kg_query_validity', 0.1),
             'is_answer_score': reward_kwargs.get('turn_is_answer_score', 0.1),
@@ -51,13 +50,13 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         
         self.verbose = reward_kwargs.get('verbose', False)
         
-        # Answer score mode: 'binary' (default) or 'f1' 
+        # Answer score mode: 'binary' or 'f1'.
         self.answer_score_mode = reward_kwargs.get('answer_score_mode', 'binary')
-        
-        # Clean logging control - set this to True to see full assistant responses
+
+        # If True, log full assistant responses.
         self.show_full_responses = reward_kwargs.get('show_full_responses', False)
         
-        # OTC (Optimal Turn Count) scaling configuration
+        # OTC (Optimal Turn Count) scaling.
         self.otc_scaling = reward_kwargs.get('otc_scaling', False)
         self.max_turns = reward_kwargs.get('max_turns', 10)  # Default max turns
         
@@ -69,7 +68,7 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             if self.show_full_responses:
                 print(f"[MultiTurnReward] Full response logging enabled")
         
-        # Track which samples we've printed for num_examine functionality
+        # Track printed samples for num_examine.
         self.printed_samples = 0
     
     def __call__(self, data, return_dict=False):
@@ -83,32 +82,30 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         Returns:
             List[Dict] or dict: Structured rewards per sample, optionally with extra info dict
         """
-        # Check if turn_sequence_tensor is available
+        # Multi-turn batches provide turn_sequence_tensor.
         turn_sequence_tensor = data.batch.get('turn_sequence_tensor')
         if turn_sequence_tensor is None:
-            # Fallback to single-turn reward calculation, but convert to structured_rewards format
+            # Fallback: run single-turn reward and wrap into structured format.
             if self.verbose:
                 print("[MultiTurnReward] No turn_sequence_tensor found, falling back to single-turn but converting to structured_rewards format")
             
-            # Call parent class to get reward_tensor
+            # Parent class returns token-level reward tensor.
             parent_result = super().__call__(data, return_dict=return_dict)
             
             # Convert parent result to structured_rewards format
             if return_dict:
-                # Parent returns {"reward_tensor": ..., "reward_extra_info": ...}
+                # Parent returns {"reward_tensor": ..., "reward_extra_info": ...}.
                 reward_tensor = parent_result.get("reward_tensor")
                 reward_extra_info = parent_result.get("reward_extra_info", {})
-                
-                # Convert reward_tensor to structured_rewards format
+
+                # Convert token-level reward -> structured reward per sample.
                 batch_size = len(data)
                 structured_rewards = []
                 for i in range(batch_size):
-                    # Extract reward value from reward_tensor
                     response_ids = data[i].batch["responses"]
                     valid_response_length = data[i].batch["attention_mask"][data[i].batch["prompts"].shape[-1]:].sum()
                     total_score = reward_tensor[i, valid_response_length - 1].item() if valid_response_length > 0 else 0.0
-                    
-                    # Create a simple structured reward dict (single-turn format)
+
                     structured_rewards.append({
                         "total_score": total_score,
                         "turn_rewards": [],  # Empty for single-turn
@@ -124,10 +121,9 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
                     "reward_extra_info": reward_extra_info,
                 }
             else:
-                # Parent returns reward_tensor directly
+                # Parent returns reward_tensor directly.
                 reward_tensor = parent_result
-                
-                # Convert to structured_rewards format
+
                 batch_size = len(data)
                 structured_rewards = []
                 for i in range(batch_size):
@@ -148,23 +144,21 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         
         batch_size = len(data)
         
-        # Store detailed reward info for analysis
+        # Keep per-sample breakdown in meta_info for analysis.
         detailed_rewards = []
         
-        # Process each sample in the batch
+        # Process each sample.
         for i in range(batch_size):
-            # Calculate multi-turn rewards for this sample
             reward_dict = self._calculate_multiturn_rewards(data, i)
             detailed_rewards.append(reward_dict)
         
-        # Store detailed rewards in meta_info for analysis
         if not hasattr(data, 'meta_info'):
             data.meta_info = {}
         data.meta_info['detailed_multiturn_rewards'] = detailed_rewards
-        
-        # Log sample responses in kg_format.py style
+
+        # Log sample responses (kg_format.py style).
         if True:
-            # Extract data source for proper header
+            # Determine data source label.
             data_source = "webqsp_kg"  # Conservative default (original)
             if hasattr(data, 'meta_info') and data.meta_info:
                 data_source = data.meta_info.get('data_source', 'webqsp_kg')
@@ -174,19 +168,18 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             
             self._log_sample_detailed(data, detailed_rewards, data_source)
             # Note: _log_multiturn_stats will be called from compute_grpo_multiturn_advantage
-        
-        # Create reward_tensor for validation compatibility
+
+        # Create reward_tensor for validation compatibility.
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         for i, reward_dict in enumerate(detailed_rewards):
-            # Get response length for this sample
             response_ids = data[i].batch["responses"]
             valid_response_length = data[i].batch["attention_mask"][data[i].batch["prompts"].shape[-1]:].sum()
-            # Place total score at the last token position (following parent class pattern)
+            # Place total score at last valid token.
             reward_tensor[i, valid_response_length - 1] = reward_dict["total_score"]
         
-        # Prepare reward_extra_info for WandB logging
+        # Prepare reward_extra_info for logging.
         if return_dict:
-            # Pass UID information for proper GRPO-style grouping in Pass@K
+            # Pass UID info for GRPO-style grouping.
             uid_info = data.non_tensor_batch.get('uid', None) if hasattr(data, 'non_tensor_batch') else None
             reward_extra_info = self._compute_wandb_metrics(detailed_rewards, uid_info)
             return {
@@ -211,26 +204,26 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         # Extract sample data
         data_item = data[sample_idx]
         
-        # Get interaction history for this sample
+        # Get interaction history for this sample.
         batch_interaction_history = data.meta_info.get("interaction_history", [])
         sample_interaction_history = {}
         if batch_interaction_history and sample_idx < len(batch_interaction_history):
             sample_interaction_history = batch_interaction_history[sample_idx]
         
-        # Parse turns from interaction history
+        # Parse turns.
         turn_data = self._parse_turns_from_interaction_history(sample_interaction_history, sample_idx)
-        
-        # Track unique queries for this sample to prevent reward hacking
+
+        # Track unique queries to reduce reward hacking.
         seen_query_ids = set()
-        
-        # Extract full assistant response text for format checking (following kg_format.py pattern)
+
+        # Decode full sequence for legacy compatibility.
         prompt_ids = data_item.batch["prompts"]
         response_ids = data_item.batch["responses"]
         attention_mask = data_item.batch["attention_mask"]
         
         prompt_length = prompt_ids.shape[-1]
         
-        # Fix: attention_mask is 2D (batch_size, seq_len), need to index correctly
+        # attention_mask may be 2D: select the sample row.
         sample_attention_mask = attention_mask[0] if attention_mask.dim() > 1 else attention_mask
         
         valid_prompt_length = sample_attention_mask[:prompt_length].sum()
@@ -239,21 +232,18 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         valid_response_length = sample_attention_mask[prompt_length:].sum()
         valid_response_ids = response_ids[:valid_response_length]
         
-        # Decode full sequence
         sequences = torch.cat((valid_prompt_ids, valid_response_ids))
         if sequences.dtype != torch.long:
             sequences = sequences.long()
         full_sequence_str = self.tokenizer.decode(sequences)
-        
-        # For multi-turn, we don't need to extract assistant response from the full sequence
-        # We use the turn-by-turn responses_str from server interaction history instead
+
+        # Multi-turn scoring primarily uses interaction_history['responses_str'].
         assistant_response = full_sequence_str  # Keep full sequence for any legacy compatibility
         
-        # Calculate turn-specific rewards with component breakdown
+        # Calculate per-turn rewards with component breakdown.
         turn_rewards = {}
         turn_components = {}  # Store individual components for WandB logging
         for turn_num, turn_info in turn_data.items():
-            # Pass current verbose state to turn calculation
             turn_reward, components = self._calculate_turn_reward_with_components(turn_info, turn_num, assistant_response, seen_query_ids, data_item, sample_idx, sample_interaction_history, verbose=self.verbose)
             turn_rewards[turn_num] = turn_reward
             turn_components[turn_num] = components
@@ -501,8 +491,8 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
             sample_interaction_history = {}
         
         turn_content = self._extract_turn_content_server_interaction(turn_info, sample_interaction_history)
-        
-        # If server interaction extraction fails, fall back to tensor-based extraction
+
+        # Normalize wrappers from chat templates (ChatML, etc.).
         turn_content = self._strip_chatml_wrappers(turn_content)
 
         if not turn_content:
@@ -520,78 +510,38 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         return (1.0 if format_valid else 0.0, turn_content)
     
     def _extract_turn_content_from_tokens(self, data_item, turn_positions: torch.Tensor) -> str:
+        """Legacy tensor-based helper (disabled).
+
+        NOTE(kgqa_agent mode): Turn content comes from interaction history
+        (`responses_str`). Token-position extraction was only used for debug.
+
+        The original implementation is preserved below for reference.
         """
-        Extract turn content using actual token positions from turn sequence tensor.
-        
-        Args:
-            data_item: Data item containing response tokens
-            turn_positions: Token positions for this turn from turn sequence tensor
-            
-        Returns:
-            str: Decoded content from the actual turn tokens
+        raise RuntimeError("Legacy tensor-based turn-content extraction is disabled in kgqa_agent mode")
         """
         try:
             if len(turn_positions) == 0:
                 return ""
-            
-            # Get full sequence tokens (input_ids = prompt + response) to match turn_sequence_tensor indexing
+
             full_tokens = data_item.batch.get("input_ids")
             if full_tokens is None:
                 return ""
-            
-            # Extract tokens at turn positions
+
             if len(full_tokens.shape) > 1:
-                full_tokens = full_tokens.squeeze(0)  # Remove batch dimension
-            
-            # Ensure positions are within bounds
+                full_tokens = full_tokens.squeeze(0)
+
             valid_positions = turn_positions[turn_positions < len(full_tokens)]
-            
-            # DEBUG: Check position filtering (reduced verbosity)
-            #            #     print(f"[DEBUG_POSITIONS] turn_positions: {len(turn_positions)} total, {len(valid_positions)} valid")
-            #     if len(turn_positions) != len(valid_positions):
-            #         filtered_out = turn_positions[turn_positions >= len(full_tokens)]
-            #         print(f"[DEBUG_POSITIONS] Filtered out {len(filtered_out)} positions >= {len(full_tokens)}")
-            #         print(f"[DEBUG_POSITIONS] Max turn_position: {turn_positions.max().item()}, sequence length: {len(full_tokens)}")
-            
             if len(valid_positions) == 0:
                 return ""
-            
+
             turn_tokens = full_tokens[valid_positions]
-            
-            # Debug logging for token extraction details (reduced verbosity)
-            # if self.verbose and len(valid_positions) < 50:  # Only for reasonable sized extractions
-            #     has_input_ids = "input_ids" in data_item.batch
-            #     has_responses = "responses" in data_item.batch
-            #     print(f"[DEBUG] Token source analysis:")
-            #     print(f"  Has input_ids: {has_input_ids}, Has responses: {has_responses}")
-            #     print(f"  Using: {'input_ids' if has_input_ids else 'responses'}")
-            #     print(f"  Full tokens length: {len(full_tokens)}")
-            #     print(f"  Total response tokens: {len(full_tokens)}")
-            #     print(f"  Valid positions: {valid_positions[:10].tolist()}..." if len(valid_positions) > 10 else f"  Valid positions: {valid_positions.tolist()}")
-            #     print(f"  Turn tokens shape: {turn_tokens.shape}")
-            
-            # Decode the tokens
             turn_content = self.tokenizer.decode(turn_tokens, skip_special_tokens=True)
-            
-            # Debug logging for extracted content (reduced verbosity)
-            #            #     print(f"\n[DEBUG] EXTRACTED TURN CONTENT:")
-            #     print(f"  Content length: {len(turn_content)} chars")
-            #     print(f"  Content preview: {turn_content[:500]}...")
-            #     
-            #     # Test format checking on extracted content
-            #     import re
-            #     think_match = re.search(r'<think>(.*?)</think>', turn_content, re.DOTALL)
-            #     kg_match = re.search(r'<kg-query>(.*?)</kg-query>', turn_content, re.DOTALL)
-            #     print(f"\n[DEBUG] FORMAT CHECK ON EXTRACTED CONTENT:")
-            #     print(f"  Has <think>...</think>: {think_match is not None}")
-            #     print(f"  Has <kg-query>...</kg-query>: {kg_match is not None}")
-            #     print(f"  Both present (good format): {think_match is not None and kg_match is not None}")
-            
             return turn_content.strip()
-            
+
         except Exception as e:
             print(f"[ERROR] Failed to extract turn content from tokens: {e}")
             return ""
+        """
     
     def _extract_turn_content_server_interaction(self, turn_info: Dict, sample_interaction_history: Dict) -> str:
         """
@@ -628,37 +578,40 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         Returns:
             str: Extracted turn content, or empty string if extraction fails
         """
+        """Legacy tensor-based helper (disabled).
+
+        NOTE(kgqa_agent mode): Turn content comes from interaction history
+        (`responses_str`). Tensor-based fallback is only for debug.
+
+        The original implementation is preserved below for reference.
+        """
+        raise RuntimeError("Legacy tensor-based turn-content extraction is disabled in kgqa_agent mode")
+        """
         try:
             turn_idx = turn_info.get('turn_idx', 0)
-            
-            
-            # Get turn_sequence_tensor from batch (tensors are stored in batch, not meta_info)
+
             turn_sequence_tensor = data_item.batch.get('turn_sequence_tensor')
             if turn_sequence_tensor is None:
                 return ""
-            
-            # Handle batch dimension - get the tensor for this sample (assuming single sample processing)
+
             if len(turn_sequence_tensor.shape) > 1:
-                sample_turn_tensor = turn_sequence_tensor[0]  # Single sample processing
+                sample_turn_tensor = turn_sequence_tensor[0]
             else:
                 sample_turn_tensor = turn_sequence_tensor
-            
-            # Find all token positions that belong to this turn (turn_idx + 1 since tensor uses 1-based indexing)
+
             target_turn_id = turn_idx + 1
             turn_token_positions = torch.where(sample_turn_tensor == target_turn_id)[0]
-            
+
             if len(turn_token_positions) == 0:
                 return ""
-            
-            # Extract turn content using the token positions
+
             turn_content = self._extract_turn_content_from_tokens(data_item, turn_token_positions)
-            
-            
             return turn_content
-            
+
         except Exception as e:
             print(f"[ERROR] Tensor-based extraction failed for turn {turn_idx}: {e}")
             return ""
+        """
     
     
     def _has_proper_kg_query_format(self, turn_content: str) -> bool:
@@ -782,43 +735,9 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         Returns:
             float: Retrieval quality reward (0-1)
         """
-        # Only calculate if this turn involved KG search
-        if not turn_info['is_search'] or turn_info['action'] != 'kg-query':
-            return 0.0
-        
-        # Check if this turn had valid action (successful query)
-        if not turn_info['valid_action']:
-            return 0.0
-        
-        search_result = turn_info.get('search_result', '')
-        raw_response = turn_info.get('raw_server_response', {})
-        
-        # We need ground truth to compare against - this should be passed from higher level
-        # For now, we'll implement a simpler quality check based on successful retrieval
-        
-        # 1. Check if the KG server returned successful results
-        success_score = self._evaluate_kg_server_success(raw_response)
-        
-        # 2. Check if the search result is non-empty and meaningful
-        content_quality_score = self._evaluate_search_content_quality(search_result)
-        
-        # 3. Check for uniqueness (avoid repetitive queries)
-        # This would need to be implemented with turn history comparison
-        uniqueness_score = 1.0  # Placeholder - implement if needed
-        
-        # Combine scores (weighted average)
-        total_score = (
-            success_score * 0.5 +           # Server success is important
-            content_quality_score * 0.4 +   # Content quality matters
-            uniqueness_score * 0.1           # Uniqueness is bonus
-        )
-        
-        if self.verbose:
-            print(f"[RetrievalQuality] success={success_score:.2f}, "
-                  f"content={content_quality_score:.2f}, "
-                  f"unique={uniqueness_score:.2f}, total={total_score:.2f}")
-        
-        return total_score
+        # NOTE(kgqa_agent mode): This method is explicitly documented as unused
+        # (retrieval quality moved to global rewards). Disable to avoid confusion.
+        raise RuntimeError("Legacy per-turn retrieval quality reward is disabled in kgqa_agent mode")
     
     def _evaluate_kg_server_success(self, raw_response: Dict) -> float:
         """
@@ -1187,15 +1106,29 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         Returns:
             float: Exact match reward (0-1)
         """
-        # Extract full solution string like the original kg_format.py
-        full_solution_text = self._extract_full_solution_text(data_item)
-        if not full_solution_text:
-            return 0.0
-        
-        # Extract assistant response like the original system
-        assistant_response = extract_assistant_response(full_solution_text)
+        # Prefer interaction_history for multi-turn runs.
+        # `responses_str` is what the environment observed each turn; token-decoding the full
+        # sequence can be truncated / misaligned, causing false-negative EM/F1.
+        assistant_response = None
+        try:
+            responses_str = interaction_history.get('responses_str') if isinstance(interaction_history, dict) else None
+            if isinstance(responses_str, list) and responses_str:
+                for chunk in reversed(responses_str):
+                    if isinstance(chunk, str) and chunk.strip():
+                        assistant_response = chunk
+                        break
+        except Exception:
+            assistant_response = None
+
+        # Fallback: extract from token-decoded sequence like the original kg_format.py
         if not assistant_response:
-            return 0.0
+            full_solution_text = self._extract_full_solution_text(data_item)
+            if not full_solution_text:
+                return 0.0
+
+            assistant_response = extract_assistant_response(full_solution_text)
+            if not assistant_response:
+                return 0.0
         
         # Get ground truth answer directly like kg_format.py
         ground_truth_raw = data_item.non_tensor_batch["reward_model"]["ground_truth"]
@@ -1215,8 +1148,38 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         else:
             ground_truth_answers = [str(ground_truth)]
         
-        # Extract the final answer from assistant response
-        predicted_answer = extract_answer_kg(assistant_response)
+        # Extract the final answer from assistant response.
+        # Align with eval + environment semantics: ONLY consider the last turn where the
+        # environment parsed the action as 'answer'. This avoids rewarding stray or malformed
+        # <answer> tags that occurred in turns the env treated as 'error'.
+        predicted_answer = None
+        try:
+            if isinstance(interaction_history, dict):
+                actions = interaction_history.get('actions')
+                responses_list = interaction_history.get('responses_str')
+                if isinstance(actions, list) and isinstance(responses_list, list):
+                    import re
+                    answer_pattern = re.compile(
+                        r'<answer>((?:(?!<answer>).)*?)</answer>',
+                        re.DOTALL | re.IGNORECASE,
+                    )
+                    for turn_idx in range(min(len(actions), len(responses_list)) - 1, -1, -1):
+                        if actions[turn_idx] != 'answer':
+                            continue
+                        chunk = responses_list[turn_idx]
+                        if not isinstance(chunk, str) or not chunk.strip():
+                            continue
+                        matches = answer_pattern.findall(chunk)
+                        if matches:
+                            predicted_answer = matches[-1].strip() or None
+                        break
+        except Exception:
+            predicted_answer = None
+
+        # Fallback (compatibility): if we don't have per-turn action logs, fall back to the
+        # extractor on the assistant response.
+        if predicted_answer is None and (not isinstance(interaction_history, dict) or 'actions' not in interaction_history):
+            predicted_answer = extract_answer_kg(assistant_response)
         
         # Check if we should use kgqa_agent-style metrics
         use_kgqa_agent_metrics = self._is_kgqa_agent_mode(interaction_history)
@@ -1282,34 +1245,7 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         
         return float(final_score)
     
-    def _extract_final_answer(self, response_text: str) -> str:
-        """
-        Extract the final answer from the response text.
-        
-        Looks for content within <answer>...</answer> tags.
-        
-        Args:
-            response_text: Full response text
-            
-        Returns:
-            str: Extracted answer or empty string if not found
-        """
-        # Use the existing extract_answer_kg function
-        extracted = extract_answer_kg(response_text)
-        
-        if extracted:
-            return extracted.strip()
-        
-        # Fallback: look for answer patterns manually
-        import re
-        answer_pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL | re.IGNORECASE)
-        matches = answer_pattern.findall(response_text)
-        
-        if matches:
-            # Take the last answer if multiple exist
-            return matches[-1].strip()
-        
-        return ""
+    
     
     def _check_exact_match(self, predicted_answer: str, ground_truth_answers: List[str], interaction_history: Dict = None, dataset_name: str = None) -> bool:
         """
@@ -1995,93 +1931,4 @@ class KGFormatMultiTurnRewardManager(KGFormatRewardManager):
         return dict(wandb_metrics)
     
     
-    def _debug_compare_extraction_methods(self, data_item, sample_interaction_history: Dict, turn_data: Dict):
-        """
-        Debug function to compare responses_str from interaction history with tensor-based extraction.
-        
-        Args:
-            data_item: Data item with tensor information and response tokens
-            sample_interaction_history: Single sample's interaction history
-            turn_data: Parsed turn data for this sample
-        """
-        print(f"\n{'='*60}")
-        print(f"{'='*60}")
-        
-        # Check if we have responses_str in interaction history
-        if 'responses_str' not in sample_interaction_history:
-            return
-        
-        responses_str_list = sample_interaction_history['responses_str']
-        # Get full response text from tokens for comparison
-        try:
-            response_ids = data_item.batch["responses"]
-            if response_ids.dim() > 1:
-                response_ids = response_ids[0]  # Single sample processing
-            full_response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-        except Exception as e:
-            return
-        
-        # Compare each turn
-        for turn_num, turn_info in turn_data.items():
-            turn_idx = turn_info['turn_idx']
-            action = turn_info['action']
-            
-            print(f"\n--- Turn {turn_num} (idx={turn_idx}, action={action}) ---")
-            
-            # Method 1: Get from responses_str (server interaction)
-            server_content = ""
-            if turn_idx < len(responses_str_list):
-                server_content = responses_str_list[turn_idx]
-                print(f"[SERVER_INTERACTION] Length: {len(server_content)} chars")
-                if server_content:
-                    print(f"[SERVER_INTERACTION] Preview: {server_content[:10000]}...")
-                else:
-                    print(f"[SERVER_INTERACTION] ❌ Empty content")
-            else:
-                print(f"[SERVER_INTERACTION] ❌ Index {turn_idx} out of bounds (list length: {len(responses_str_list)})")
-            
-            # Method 2: Get from tensor-based extraction
-            tensor_content = ""
-            try:
-                tensor_content = self._extract_turn_content_tensor_based(turn_info, data_item, full_response_text)
-                print(f"[TENSOR_BASED] Length: {len(tensor_content)} chars")
-                if tensor_content:
-                    print(f"[TENSOR_BASED] Preview: {tensor_content[:10000]}...")
-                else:
-                    print(f"[TENSOR_BASED] ❌ Empty content")
-            except Exception as e:
-                print(f"[TENSOR_BASED] ❌ Extraction failed: {e}")
-            
-            # Compare the two methods
-            if server_content and tensor_content:
-                # Normalize for comparison (strip whitespace)
-                server_normalized = server_content.strip()
-                tensor_normalized = tensor_content.strip()
-                
-                if server_normalized == tensor_normalized:
-                    print(f"[COMPARISON] ✅ EXACT MATCH")
-                else:
-                    print(f"[COMPARISON] ❌ MISMATCH DETECTED")
-                    print(f"  Server length: {len(server_normalized)}")
-                    print(f"  Tensor length: {len(tensor_normalized)}")
-                    
-                    # Show first difference
-                    min_len = min(len(server_normalized), len(tensor_normalized))
-                    for i in range(min_len):
-                        if server_normalized[i] != tensor_normalized[i]:
-                            print(f"  First diff at position {i}:")
-                            print(f"    Server: '{server_normalized[max(0,i-10):i+10]}'")
-                            print(f"    Tensor: '{tensor_normalized[max(0,i-10):i+10]}'")
-                            break
-                    
-                    if len(server_normalized) != len(tensor_normalized):
-                        print(f"  Length difference: {abs(len(server_normalized) - len(tensor_normalized))} chars")
-            elif server_content and not tensor_content:
-                print(f"[COMPARISON] ⚠️  Server has content, tensor extraction failed")
-            elif not server_content and tensor_content:
-                print(f"[COMPARISON] ⚠️  Tensor has content, server extraction failed") 
-            else:
-                print(f"[COMPARISON] ❌ Both methods failed to extract content")
-        
-        print(f"{'='*60}")
-        print(f"{'='*60}\n")
+    

@@ -74,6 +74,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.n=1 \
     +actor_rollout_ref.rollout.grpo_rollout_n=4 \
+    '+actor_rollout_ref.rollout.stop=["</kg-query>","</answer>"]' \
     actor_rollout_ref.rollout.search.enable=true \
     actor_rollout_ref.rollout.search.enable_during_training=true \
     actor_rollout_ref.rollout.search.enable_during_validation=true \

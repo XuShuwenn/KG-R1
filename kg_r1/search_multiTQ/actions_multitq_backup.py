@@ -4,6 +4,11 @@ Action handlers for MultiTQ Knowledge Graph Retrieval.
 Adapted for temporal reasoning with MultiTQ's split-wise KG structure.
 """
 
+# NOTE(kgqa_agent mode): legacy MultiTQ FastAPI action handlers are not used.
+raise RuntimeError("kg_r1.search_multiTQ.actions_multitq_backup is legacy and disabled in kgqa_agent mode")
+
+'''
+
 import json
 import time
 import uuid
@@ -455,3 +460,5 @@ ACTION_REGISTRY_MULTITQ = {
     ActionType.GET_TAIL_ENTITIES: GetTailEntitiesAction
     # Removed: GET_TEMPORAL_FACTS and GET_ENTITY_TIMELINE as requested
 }
+
+'''

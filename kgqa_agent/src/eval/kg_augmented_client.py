@@ -87,12 +87,15 @@ class KGAugmentedModelClient(BaseModelClient):
         return None
     
     def _extract_answer_tag(self, text: str) -> Optional[str]:
-        """Extract <answer>...</answer> content."""
+        """Extract <answer>[...]</answer> content."""
         # Use regex that avoids matching across intermediate <answer> tags
         # and prefer the last occurrence if multiple exist.
         matches = re.findall(r'<answer>((?:(?!<answer>).)*?)</answer>', text, re.DOTALL)
         if matches:
-            return matches[-1].strip()
+            candidate = matches[-1].strip()
+            if candidate.startswith("[") and candidate.endswith("]"):
+                return candidate
+            return None
         return None
 
     def _parse_and_execute_query(self, query_str: str, question: str = "") -> str:
@@ -132,7 +135,7 @@ class KGAugmentedModelClient(BaseModelClient):
             relations = self.kg_client.get_relations(
                 entity_resolved,
                 question=augmented_question,
-                top_k=self.kg_top_k * 3,
+                top_k=50,
             )
             
             # If there are many candidates, use LLM to re-rank/filter them.

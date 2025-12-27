@@ -23,7 +23,7 @@ def build_continuation_prompt(query_results: str) -> str:
 
 # Minimal force-answer prompt when max calls reached
 FORCE_ANSWER_PROMPT = """You have reached the maximum number of queries. Based on the information gathered, provide your final answer in `<answer>` tags.
-Strict Format: `<answer>["Answer1", "Answer2"]</answer>`. The answer(s) must be concise entity names copied exactly from the KG results.
+The answer(s) must be concise entity names copied exactly from the KG results.
 """
 
 

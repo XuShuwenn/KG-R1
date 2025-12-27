@@ -5,6 +5,13 @@ This file defines the action types and their corresponding handler classes.
 Each action class implements the logic for a specific KG operation.
 """
 
+# NOTE(kgqa_agent mode): The SPARQL-bridge training path never uses the legacy
+# KG-R1 FastAPI retrieval server actions. Preserve the original code below for
+# reference, but comment it out to avoid accidental usage.
+raise RuntimeError("kg_r1.search.actions is legacy and disabled in kgqa_agent mode")
+
+'''
+
 import json
 import os
 import logging
@@ -648,3 +655,5 @@ def get_filtered_action_registry(action_names: List[str] = None) -> Dict[ActionT
             logger.warning(f"Unknown action name: {action_name}")
     
     return filtered_registry
+
+'''

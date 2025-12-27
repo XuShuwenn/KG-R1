@@ -79,12 +79,15 @@ from verl.utils.metric import (
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-# Import Role enum from the original trainer to ensure compatibility
+# Role enum from the base trainer.
 from verl.trainer.ppo.ray_trainer import Role
-# Import answer extraction utilities to fix prediction extraction from multi-turn conversations
-from verl.utils.reward_score.qa_em_format_kg import extract_assistant_response, extract_answer_kg
+# Answer extraction utilities for multi-turn outputs.
+from verl.utils.reward_score.qa_em_format_kg import (
+    extract_assistant_response,
+    extract_answer_kg,
+)
 
-# Debug-only prints in this file can be very verbose. Keep them off by default.
+# Debug prints can be very verbose.
 _DEBUG_TRAINER = os.environ.get("VERL_TRAINER_DEBUG", "0").lower() not in {"0", "false", ""}
 
 
@@ -214,7 +217,7 @@ def _build_generation_pop_keys(batch: DataProto, *, include_meta_info_keys: bool
     if "raw_prompt" in batch.non_tensor_batch:
         non_tensor_batch_keys_to_pop.append("raw_prompt")
 
-    # CRITICAL: Add sample_id and dataset_name to include them in gen_batch
+    # Include ids in gen_batch so generation can propagate them.
     if "sample_id" in batch.non_tensor_batch:
         non_tensor_batch_keys_to_pop.append("sample_id")
     if "dataset_name" in batch.non_tensor_batch:
@@ -857,8 +860,6 @@ class RayPPOTrainer:
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
 
-
-
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
@@ -1167,7 +1168,7 @@ class RayPPOTrainer:
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
         def _extract_prediction_from_text(text):
-            """Extract model prediction from <answer>...</answer>.
+            """Extract model prediction from <answer>[...]</answer>.
             
             CRITICAL FIX: For multi-turn conversations, we must extract the last
             assistant response FIRST using extract_assistant_response(), then use
@@ -1203,7 +1204,8 @@ class RayPPOTrainer:
                 # (single-turn case or parsing error)
                 pass
 
-            # CRITICAL FIX Step 2: Use extract_answer_kg() to properly handle nested/incomplete tags
+            # Step 2: Use extract_answer_kg() to properly handle nested/incomplete tags.
+            # It returns None unless the content is bracketed like: ["a", "b"].
             # This handles cases where the text contains "<answer>" in descriptions
             try:
                 answer_content = extract_answer_kg(text)
@@ -1213,7 +1215,7 @@ class RayPPOTrainer:
                 try:
                     return json.loads(answer_content)
                 except Exception:
-                    # Return raw string if JSON parsing fails
+                    # Keep raw bracketed string if JSON parsing fails
                     return answer_content
             except Exception:
                 # Fallback to old regex-based extraction
@@ -1231,7 +1233,7 @@ class RayPPOTrainer:
             m = re.findall(r"<answer>(.*?)</answer>", text, flags=re.DOTALL | re.IGNORECASE)
             if m:
                 inner = _strip_code_fence(m[-1])
-                if not inner:
+                if not inner or not (inner.startswith("[") and inner.endswith("]")):
                     return None
                 try:
                     return json.loads(inner)
@@ -1255,7 +1257,9 @@ class RayPPOTrainer:
                 return None
             if not isinstance(hist_list, list):
                 return hist_list
-            drop_keys = {"raw_server_responses", "responses_str", "reasonings"}
+            # Keep raw_server_responses and responses_str for reward calculation
+            # Only drop reasonings as it's not used and can be large
+            drop_keys = {"reasonings"}
             sanitized = []
             for h in hist_list:
                 if isinstance(h, dict):
@@ -1263,6 +1267,7 @@ class RayPPOTrainer:
                 else:
                     sanitized.append(h)
             return sanitized
+
 
         n = len(inputs)
         base_data = {
@@ -1736,7 +1741,13 @@ class RayPPOTrainer:
 
             search_url = self.search_config.get('search_url')
             if search_url is None:
-                search_url = self.kg_bridge_config.get('server_url', 'http://127.0.0.1:8001/retrieve')
+                # NOTE(kgqa_agent mode): when use_sparql_bridge=True we do not use the
+                # legacy FastAPI KG retrieval server URL.
+                if self.kg_bridge_config.get('use_sparql_bridge', False):
+                    search_url = None
+                else:
+                    # search_url = self.kg_bridge_config.get('server_url', 'http://127.0.0.1:8001/retrieve')
+                    search_url = self.kg_bridge_config.get('server_url')
 
             topk_value = self.search_config.get('topk')
             if topk_value is None:
@@ -1959,8 +1970,8 @@ class RayPPOTrainer:
         list so they get included in the gen_batch that's passed to generation.
         
         CLEAN TRAINING LOOP:
-===================
-The trainer handles KG-augmented training with minimal logging to avoid spam.
+        ===================
+        The trainer handles KG-augmented training with minimal logging to avoid spam.
         
         This helps monitor the quality of knowledge graph queries during training.
         
@@ -2475,6 +2486,18 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                                         text = text[:-len(tag)].strip()
                                 return text
 
+                            def remove_chat_template_from_first_turn(text: str) -> str:
+                                """Remove chat template markers from the first user message for readability."""
+                                import re
+                                # Remove system prompt and markers: <|im_start|>system....<|im_end|>\n<|im_start|>user\n
+                                text = re.sub(r'<\|im_start\|>system.*?<\|im_end\|>\n<\|im_start\|>user\n', '', text, flags=re.DOTALL)
+                                # Remove trailing assistant marker: \n<|im_end|>\n<|im_start|>assistant
+                                text = re.sub(r'\n<\|im_end\|>\n<\|im_start\|>assistant\s*$', '', text)
+                                # Also handle case where user marker appears without system
+                                text = re.sub(r'^<\|im_start\|>user\n', '', text)
+                                text = re.sub(r'<\|im_end\|>$', '', text)
+                                return text.strip()
+
                             def append_raw_prompt_turns(raw_prompt_obj, turns):
                                 """Append raw prompt messages (list of role/content) without chat-template tokens."""
                                 if isinstance(raw_prompt_obj, list):
@@ -2495,7 +2518,9 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                                     if raw_prompts is not None and idx < len(raw_prompts):
                                         append_raw_prompt_turns(raw_prompts[idx], turns)
                                     elif input_prompt and input_prompt.strip():
-                                        turns.append({"user": remove_think_tag(input_prompt)})
+                                        # Clean chat template markers from the first user message for readability
+                                        cleaned_prompt = remove_chat_template_from_first_turn(input_prompt)
+                                        turns.append({"user": remove_think_tag(cleaned_prompt)})
 
                                     responses = hist.get("responses_str", [])
                                     search_results = hist.get("search_results", [])
@@ -2511,7 +2536,9 @@ The trainer handles KG-augmented training with minimal logging to avoid spam.
                                     if raw_prompts is not None and idx < len(raw_prompts):
                                         append_raw_prompt_turns(raw_prompts[idx], turns)
                                     elif input_prompt and input_prompt.strip():
-                                        turns.append({"user": remove_think_tag(input_prompt)})
+                                        # Clean chat template markers from the first user message for readability
+                                        cleaned_prompt = remove_chat_template_from_first_turn(input_prompt)
+                                        turns.append({"user": remove_think_tag(cleaned_prompt)})
                                     conversation_turns_list.append(turns)
                             
                             # Decode outputs from batch.batch["responses"]

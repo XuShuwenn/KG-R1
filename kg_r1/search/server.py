@@ -4,6 +4,13 @@ FastAPI server for Knowledge Graph Retrieval.
 This module contains the FastAPI application and the KnowledgeGraphRetriever class.
 """
 
+# NOTE(kgqa_agent mode): The training pipeline uses the SPARQL bridge and does not
+# run the legacy FastAPI KG retrieval server. The original server implementation is
+# kept below for reference, but is intentionally commented out.
+raise RuntimeError("kg_r1.search.server is legacy and disabled in kgqa_agent mode")
+
+'''
+
 import time
 import logging
 import asyncio
@@ -336,3 +343,5 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, workers: int = 1, thread
     
     # Use single worker for now - the ThreadPoolExecutor provides concurrency within each worker
     uvicorn.run(app, host=host, port=port, workers=1)
+
+'''

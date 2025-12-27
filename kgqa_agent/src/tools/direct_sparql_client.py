@@ -74,12 +74,16 @@ class DirectSPARQLKGClient:
         return dotted
 
     def _apply_relation_whitelist(self, relations: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Filter relations by whitelist; fallback to original if all filtered out."""
+        """Filter relations by whitelist.
+
+        NOTE: This is intentionally strict.
+        For CWQ training, falling back to the original (unfiltered) relations will
+        re-introduce schema / metadata predicates (e.g., type.object.name,
+        common.topic.image), which harms KG-search quality and training stability.
+        """
         if not relations or not self._relation_whitelist:
             return relations
-        filtered = [r for r in relations if r.get("relation") in self._relation_whitelist]
-        # If filtering removes everything, fall back to original to avoid total loss
-        return filtered or relations
+        return [r for r in relations if r.get("relation") in self._relation_whitelist]
     
     def _is_cvt_node(self, tail_id: str, tail_name: str) -> bool:
         """Check if a node is a CVT node (no entity name, only MID starting with m. or g.)."""
@@ -94,49 +98,6 @@ class DirectSPARQLKGClient:
             return True
         return False
     
-    def _is_meaningless_pattern_relation(self, relation: str) -> bool:
-        """Check if a relation is a meaningless pattern relation that should be skipped.
-        
-        These are metadata relations that don't provide meaningful information for the model,
-        such as type.object.type, government.government_position_held, etc.
-        """
-        # Patterns to skip (exact matches or prefixes)
-        skip_patterns = [
-            # 1. 用于描述类型体系(Type System)的关系
-            "type.object.type",
-            "type.type.instance",
-            "type.type.properties",
-            "type.property.schema",
-            # 2. CVT 上用于声明 schema / 结构化元数据的关系
-            "common.topic.article",
-            "common.topic.image",
-            "common.image_source",
-            "common.document",
-            "common.webpage",
-            "common.license",
-            "common.topic.description",
-            # 3. "schema-only" CVT 关系（不会构成真实语义路径）
-            "freebase.type_hints.included_types",
-            "freebase.property_hints.best_value_properties",
-            "freebase.property_hints.mediator",
-            "freebase.property_hints.unit",
-            "freebase.property_hints.expected_type",
-            "freebase.type_hints.enumeration"
-            # 4. 所有“type.object.*”下的关系（层级、域、权限等）
-            "type.object.key",             # Key 信息
-            "type.object.permission",      # 权限信息
-            "type.object.profile",         # 元描述
-            "type.object.service"          # 服务类元数据
-            # 5. 用于 CVT 内部结构组织的"辅助关系"
-            # 这些关系不会作为 path hop，用来连接真正实体
-            "common.topic.topic_equivalent_webpage",
-            "common.topic.topic_equivalent",
-        ]
-        
-        for pattern in skip_patterns:
-            if relation == pattern or relation.startswith(pattern + "."):
-                return True
-        return False
     
     def _get_common_prefix(self, rel1: str, rel2: str) -> str:
         """Get the common prefix of two relations (dot-separated)."""
@@ -204,7 +165,7 @@ class DirectSPARQLKGClient:
             logger.warning(f"Failed to resolve entity: '{entity}'")
             return None
     
-    def get_relations(self, entity: str, limit: int = 100, question: str = "", top_k: int = 10, 
+    def get_relations(self, entity: str, limit: int = 100, question: str = "", top_k: int = 50, 
                      include_flatten: bool = True) -> List[Dict[str, str]]:
         """Get all relations (head and tail) for an entity; whitelist-filter and BM25-rank.
         
@@ -283,11 +244,12 @@ class DirectSPARQLKGClient:
                     if flatten_rel not in [r.get("relation") for r in relations]:
                         relations.append({"relation": flatten_rel})
             
-            # Apply whitelist; fallback if empty
+            # Apply whitelist (strict; may become empty)
             relations = self._apply_relation_whitelist(relations)
             
-            # Filter out meaningless pattern relations before BM25 ranking
-            relations = [r for r in relations if not self._is_meaningless_pattern_relation(r.get("relation", ""))]
+            # NOTE: Only whitelist + LLM filtering (via callback) is applied.
+            # _is_meaningless_pattern_relation removed to avoid over-filtering
+            # since whitelist already excludes most metadata relations.
             
             # Rank by BM25 similarity if question provided
             if question and relations:
@@ -495,17 +457,11 @@ class DirectSPARQLKGClient:
                         if cvt_rel_uri:
                             cvt_rel_id = cvt_rel_uri.replace("http://rdf.freebase.com/ns/", "").replace("/", ".")
                             # Skip meaningless pattern relations
-                            if self._is_meaningless_pattern_relation(cvt_rel_id):
-                                continue
                             cvt_relations_raw.append(cvt_rel_id)
                     
-                    # Apply whitelist filtering to CVT relations before flattening
+                    # Apply whitelist filtering to CVT relations before flattening (strict)
                     if self._relation_whitelist and cvt_relations_raw:
-                        cvt_relations_filtered = [r for r in cvt_relations_raw if r in self._relation_whitelist]
-                        if not cvt_relations_filtered:
-                            # If whitelist filters out all relations, fall back to original
-                            cvt_relations_filtered = cvt_relations_raw
-                        cvt_relations = cvt_relations_filtered
+                        cvt_relations = [r for r in cvt_relations_raw if r in self._relation_whitelist]
                     else:
                         cvt_relations = cvt_relations_raw
                     
@@ -555,17 +511,11 @@ class DirectSPARQLKGClient:
                         if cvt_rel_uri:
                             cvt_rel_id = cvt_rel_uri.replace("http://rdf.freebase.com/ns/", "").replace("/", ".")
                             # Skip meaningless pattern relations
-                            if self._is_meaningless_pattern_relation(cvt_rel_id):
-                                continue
                             cvt_relations_raw.append(cvt_rel_id)
                     
-                    # Apply whitelist filtering to CVT relations before flattening
+                    # Apply whitelist filtering to CVT relations before flattening (strict)
                     if self._relation_whitelist and cvt_relations_raw:
-                        cvt_relations_filtered = [r for r in cvt_relations_raw if r in self._relation_whitelist]
-                        if not cvt_relations_filtered:
-                            # If whitelist filters out all relations, fall back to original
-                            cvt_relations_filtered = cvt_relations_raw
-                        cvt_relations = cvt_relations_filtered
+                        cvt_relations = [r for r in cvt_relations_raw if r in self._relation_whitelist]
                     else:
                         cvt_relations = cvt_relations_raw
                     
@@ -868,10 +818,32 @@ class DirectSPARQLKGClient:
                 all_relations.extend(rels)
             return all_relations
     
-    def clear_pending_flatten_relations(self):
-        """Clear pending flatten relations. Call this when a question is complete."""
-        if hasattr(self, '_pending_flatten_relations'):
+    def clear_pending_flatten_relations(self, entity_ids: Optional[List[str]] = None):
+        """Clear pending flatten relations.
+
+        Args:
+            entity_ids: If None, clear all pending flatten relations (backward compatible).
+                       If provided, remove only entries for the specified entity IDs.
+
+        Note: This cache is used to surface CVT-derived flatten relations in subsequent
+        get_relations() calls. In multi-sample training, callers may want to clear only
+        the current sample's entities to avoid cross-sample interference.
+        """
+        if not hasattr(self, '_pending_flatten_relations'):
+            return
+
+        if entity_ids is None:
             self._pending_flatten_relations = {}
+            return
+
+        # Defensive: accept a single string.
+        if isinstance(entity_ids, str):
+            entity_ids = [entity_ids]
+
+        for eid in entity_ids:
+            if not eid:
+                continue
+            self._pending_flatten_relations.pop(eid, None)
     
     def format_relations_for_prompt(self, relations: List[Dict[str, str]]) -> str:
         """Format relations for prompt."""
